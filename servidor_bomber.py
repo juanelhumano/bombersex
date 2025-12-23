@@ -3,8 +3,8 @@ import json
 import uuid
 import random
 import os
-import websockets # Usamos la importación estándar (Legacy)
-import http # Para códigos de estado HTTP
+import websockets # Usamos la importación estándar (Legacy API)
+from websockets.http import Headers # Necesario para la respuesta HTTP manual
 
 # Constantes base
 WALL_HARD = 1
@@ -170,7 +170,6 @@ class BombermanServer:
                 idx += 1
             await self.broadcast({"type": "reset_game", "map": self.map, "players": self.players, "grid_size": self.grid_size, "host_id": list(self.players.keys())[0]})
 
-    # Actualizado para aceptar el argumento 'path' (estándar en legacy websockets)
     async def handler(self, websocket, path):
         if self.game_started:
             await websocket.send(json.dumps({
@@ -259,18 +258,29 @@ class BombermanServer:
         except: pass
         finally: await self.handle_disconnect(websocket)
 
-# Health check compatible con websockets legacy (usa tuplas, no objetos)
+# --- TU CÓDIGO SUGERIDO (Correcto para legacy API) ---
 async def process_request(path, request_headers):
+    # Responde OK a los health checks de Render o navegadores
     if path == "/health" or path == "/":
-        return (http.HTTPStatus.OK, [], b"OK")
+        return (
+            200,
+            Headers({"Content-Type": "text/plain"}),
+            b"OK"
+        )
     return None
 
 async def main():
     PORT = int(os.environ.get("PORT", 10000))
-    print(f"🔥 Servidor V13 (Legacy Stable) - Puerto {PORT}")
+    print(f"🔥 Servidor V14 (Legacy Fix + HealthCheck) - Puerto {PORT}")
     server = BombermanServer()
-    # Usamos websockets.serve estándar que acepta tuplas en process_request
-    async with websockets.serve(server.handler, "0.0.0.0", PORT, process_request=process_request):
+    
+    # Usamos websockets.serve (API clásica) con tu process_request
+    async with websockets.serve(
+        server.handler, 
+        "0.0.0.0", 
+        PORT, 
+        process_request=process_request
+    ):
         print("Esperando conexiones...")
         await asyncio.Future()
 
