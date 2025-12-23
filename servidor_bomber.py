@@ -15,22 +15,19 @@ ITEM_GHOST = 5
 ITEM_KICK = 6 
 ITEM_AMMO = 7
 
-# --- CLASE DE UNA SALA DE JUEGO INDIVIDUAL ---
 class GameRoom:
     def __init__(self, room_id):
         self.room_id = room_id
-        self.clients = {} # ws -> pid
-        self.players = {} # pid -> data
+        self.clients = {} 
+        self.players = {} 
         self.game_started = False
         self.grid_size = 15
         self.map = []
         self.bombs = [] 
         self.regenerate_map(15)
-        # Iniciamos la física de ESTA sala
         self.physics_task = asyncio.create_task(self.physics_loop())
 
     def stop(self):
-        # Limpieza para no dejar procesos zombie
         if self.physics_task:
             self.physics_task.cancel()
 
@@ -38,7 +35,6 @@ class GameRoom:
         self.grid_size = size
         self.map = [[0 for _ in range(size)] for _ in range(size)]
         
-        # 1. Generación Base
         for y in range(size):
             for x in range(size):
                 if x == 0 or x == size-1 or y == 0 or y == size-1:
@@ -50,7 +46,6 @@ class GameRoom:
                 else:
                     self.map[y][x] = FLOOR
 
-        # 2. LIMPIEZA DE SEGURIDAD (Spawn Zones)
         safe_spots = [
             (1, 1), (1, 2), (2, 1),
             (1, size-2), (1, size-3), (2, size-2),
@@ -100,6 +95,18 @@ class GameRoom:
             })
             await self.check_win_condition()
 
+    # --- NUEVO: Desactiva el modo fantasma después de X segundos ---
+    async def disable_ghost_later(self, pid, duration):
+        await asyncio.sleep(duration)
+        if pid in self.players and self.players[pid]['alive']:
+            self.players[pid]['ghost'] = False
+            # Avisamos al cliente específicamente que se acabó
+            await self.broadcast({
+                'type': 'powerup_expired', 
+                'id': pid, 
+                'kind': 'GHOST'
+            })
+
     async def physics_loop(self):
         try:
             while True:
@@ -115,18 +122,31 @@ class GameRoom:
                         gx = int((new_x + 32) // 64)
                         gy = int((new_y + 32) // 64)
                         
+                        collision = False
+                        
                         if 0 <= gx < self.grid_size and 0 <= gy < self.grid_size:
                             if self.map[gy][gx] != FLOOR:
-                                b['vx'] = 0; b['vy'] = 0
-                                b['x'] = round(b['x'] / 64) * 64
-                                b['y'] = round(b['y'] / 64) * 64
-                                moved = True
-                            else:
-                                b['x'] = new_x
-                                b['y'] = new_y
-                                moved = True
+                                collision = True
                         else:
+                            collision = True 
+
+                        if not collision:
+                            for other in self.bombs:
+                                if other is b: continue 
+                                dist = ((new_x - other['x'])**2 + (new_y - other['y'])**2)**0.5
+                                if dist < 50: 
+                                    collision = True
+                                    break
+
+                        if collision:
                             b['vx'] = 0; b['vy'] = 0
+                            b['x'] = round(b['x'] / 64) * 64
+                            b['y'] = round(b['y'] / 64) * 64
+                            moved = True
+                        else:
+                            b['x'] = new_x
+                            b['y'] = new_y
+                            moved = True
                 
                 if moved:
                     await self.broadcast({'type': 'bombs_update', 'bombs': self.bombs})
@@ -199,38 +219,28 @@ class GameRoom:
             await self.broadcast({"type": "reset_game", "map": self.map, "players": self.players, "grid_size": self.grid_size, "host_id": list(self.players.keys())[0]})
 
 
-# --- GESTOR DE SALAS Y CONEXIONES ---
-active_rooms = {} # id -> GameRoom
+active_rooms = {} 
 
 async def handle_request(request):
-    # Health Check
     if request.headers.get('Upgrade', '').lower() != 'websocket':
         return web.Response(text=f"BomberServer OK - {len(active_rooms)} Rooms Active")
 
     ws = web.WebSocketResponse()
     await ws.prepare(request)
 
-    # ESPERAR EL PRIMER MENSAJE DE LOGIN (Crear o Unirse)
     try:
         current_room = None
-        
-        # Leemos el primer mensaje para saber qué quiere hacer el cliente
         msg = await ws.receive()
         if msg.type == WSMsgType.TEXT:
             login_data = json.loads(msg.data)
             
-            # --- CREAR SALA ---
             if login_data['action'] == 'CREATE':
-                # Generar ID de 4 dígitos
                 room_id = str(random.randint(1000, 9999))
                 while room_id in active_rooms:
                     room_id = str(random.randint(1000, 9999))
-                
                 current_room = GameRoom(room_id)
                 active_rooms[room_id] = current_room
-                print(f"Sala creada: {room_id}")
             
-            # --- UNIRSE A SALA ---
             elif login_data['action'] == 'JOIN':
                 room_id = login_data.get('code')
                 if room_id in active_rooms:
@@ -240,18 +250,15 @@ async def handle_request(request):
                     await ws.close()
                     return ws
 
-            # --- LÓGICA DE JUEGO (Ya dentro de una sala) ---
             if current_room:
                 if current_room.game_started:
                      await ws.send_json({"type": "error", "message": "⚠️ PARTIDA EN CURSO ⚠️"})
                      await ws.close()
                      return ws
 
-                # Asignar ID y enviar estado inicial
                 pid = str(uuid.uuid4())[:8]
                 current_room.clients[ws] = pid
                 
-                # Setup Jugador
                 pos = current_room.get_start_pos(len(current_room.players))
                 colors = ["#ef4444", "#3b82f6", "#22c55e", "#eab308", "#a855f7", "#ec4899"]
                 
@@ -261,10 +268,9 @@ async def handle_request(request):
                     "alive": True, "range": 1, "max_bombs": 1, "ghost": False, "kick": False
                 }
 
-                # Enviar confirmación de sala y datos
                 await ws.send_json({
                     "type": "init", 
-                    "room_code": current_room.room_id, # Enviamos el código para que lo vean
+                    "room_code": current_room.room_id,
                     "id": pid, 
                     "players": current_room.players, 
                     "map": current_room.map, 
@@ -274,7 +280,6 @@ async def handle_request(request):
                 })
                 await current_room.broadcast({'type': 'player_joined', 'player': current_room.players[pid]}, exclude=ws)
 
-                # BUCLE PRINCIPAL DEL JUGADOR
                 async for msg in ws:
                     if msg.type == WSMsgType.TEXT:
                         data = json.loads(msg.data)
@@ -282,7 +287,6 @@ async def handle_request(request):
                         if not p: continue
 
                         if data["type"] == "start_trigger":
-                            # Lógica de inicio (delegada a la sala)
                             cnt = len(current_room.players)
                             sz = 13 if cnt <= 2 else (19 if cnt >= 5 else 15)
                             current_room.regenerate_map(sz)
@@ -296,7 +300,6 @@ async def handle_request(request):
                             await current_room.broadcast({"type": "start_game_signal"})
 
                         elif data["type"] == "move" and p['alive']:
-                            # Movimiento, items y kick
                             gx, gy = int((data['x'] + 32) // 64), int((data['y'] + 32) // 64)
                             if 0 <= gy < current_room.grid_size and 0 <= gx < current_room.grid_size:
                                 cell = current_room.map[gy][gx]
@@ -304,7 +307,12 @@ async def handle_request(request):
                                     kind = 'UNKNOWN'
                                     if cell == ITEM_FIRE: p['range'] += 1; kind = 'FIRE'
                                     elif cell == ITEM_SPEED: kind = 'SPEED'
-                                    elif cell == ITEM_GHOST: p['ghost'] = True; kind = 'GHOST'
+                                    # LOGICA DEL GHOST TEMPORAL
+                                    elif cell == ITEM_GHOST: 
+                                        p['ghost'] = True
+                                        kind = 'GHOST'
+                                        # Inicia temporizador de 15 segundos
+                                        asyncio.create_task(current_room.disable_ghost_later(pid, 15))
                                     elif cell == ITEM_KICK: p['kick'] = True; kind = 'KICK'
                                     elif cell == ITEM_AMMO: p['max_bombs'] += 1; kind = 'AMMO'
                                     current_room.map[gy][gx] = FLOOR
@@ -334,12 +342,9 @@ async def handle_request(request):
                                     await current_room.broadcast({"type": "bombs_update", "bombs": current_room.bombs})
 
     finally:
-        # Desconexión y limpieza
         if current_room:
             await current_room.handle_disconnect(ws)
-            # Si la sala se queda vacía, la borramos para ahorrar memoria
             if not current_room.clients:
-                print(f"Sala vacía {current_room.room_id}, eliminando...")
                 current_room.stop()
                 if current_room.room_id in active_rooms:
                     del active_rooms[current_room.room_id]
@@ -348,7 +353,7 @@ async def handle_request(request):
 
 async def main():
     PORT = int(os.environ.get("PORT", 10000))
-    print(f"🔥 Servidor V17 (Room System) - Puerto {PORT}")
+    print(f"🔥 Servidor V21 (GhostTimer + Mobile) - Puerto {PORT}")
     
     app = web.Application()
     app.add_routes([web.get('/', handle_request), web.get('/health', handle_request)])
@@ -358,7 +363,6 @@ async def main():
     site = web.TCPSite(runner, '0.0.0.0', PORT)
     await site.start()
     
-    print("🚀 Sistema de Salas Activo")
     await asyncio.Future()
 
 if __name__ == "__main__":
