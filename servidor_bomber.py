@@ -3,8 +3,7 @@ import json
 import uuid
 import random
 import os
-import websockets # Usamos la importación estándar (Legacy API)
-from websockets.http import Headers # Necesario para la respuesta HTTP manual
+from aiohttp import web, WSMsgType
 
 # Constantes base
 WALL_HARD = 1
@@ -18,8 +17,8 @@ ITEM_AMMO = 7
 
 class BombermanServer:
     def __init__(self):
-        self.clients = {}
-        self.players = {}
+        self.clients = {} # ws -> pid
+        self.players = {} # pid -> data
         self.game_started = False
         self.grid_size = 15
         self.map = []
@@ -53,16 +52,21 @@ class BombermanServer:
         if not self.clients: return
         data = json.dumps(message)
         disconnected = []
-        for ws in self.clients:
+        for ws in list(self.clients.keys()):
             if ws != exclude:
-                try: await ws.send(data)
-                except: disconnected.append(ws)
-        for ws in disconnected: await self.handle_disconnect(ws)
+                try: 
+                    # aiohttp usa send_str
+                    await ws.send_str(data)
+                except: 
+                    disconnected.append(ws)
+        
+        for ws in disconnected: 
+            await self.handle_disconnect(ws)
 
-    async def handle_disconnect(self, websocket):
-        if websocket in self.clients:
-            pid = self.clients[websocket]
-            del self.clients[websocket]
+    async def handle_disconnect(self, ws):
+        if ws in self.clients:
+            pid = self.clients[ws]
+            del self.clients[ws]
             if pid in self.players:
                 del self.players[pid]
             
@@ -170,15 +174,27 @@ class BombermanServer:
                 idx += 1
             await self.broadcast({"type": "reset_game", "map": self.map, "players": self.players, "grid_size": self.grid_size, "host_id": list(self.players.keys())[0]})
 
-    async def handler(self, websocket, path):
-        if self.game_started:
-            await websocket.send(json.dumps({
-                "type": "error", "message": "⚠️ PARTIDA EN CURSO ⚠️\nEspera a que termine la ronda."
-            }))
-            return 
+    # --- HANDLER PARA AIOHTTP (Maneja HTTP y WS) ---
+    async def handle_request(self, request):
+        # 1. Si es Health Check (HTTP), responde OK
+        if request.headers.get('Upgrade', '').lower() != 'websocket':
+            return web.Response(text="OK - Bomberman Server Running")
 
+        # 2. Si es WebSocket, inicia la conexión
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+
+        # Si el juego ya empezó, rechazar conexión
+        if self.game_started:
+            await ws.send_json({
+                "type": "error", "message": "⚠️ PARTIDA EN CURSO ⚠️\nEspera a que termine la ronda."
+            })
+            await ws.close()
+            return ws
+
+        # Inicialización de jugador
         pid = str(uuid.uuid4())[:8]
-        self.clients[websocket] = pid
+        self.clients[ws] = pid
         pos = self.get_start_pos(len(self.players))
         colors = ["#ef4444", "#3b82f6", "#22c55e", "#eab308", "#a855f7", "#ec4899"]
         
@@ -188,101 +204,98 @@ class BombermanServer:
             "alive": True, "range": 1, "max_bombs": 1, "ghost": False, "kick": False
         }
         
-        await websocket.send(json.dumps({
+        await ws.send_json({
             "type": "init", "id": pid, "players": self.players, 
             "map": self.map, "game_started": self.game_started, 
             "host_id": list(self.players.keys())[0], "grid_size": self.grid_size
-        }))
-        await self.broadcast({'type': 'player_joined', 'player': self.players[pid]}, exclude=websocket)
+        })
+        await self.broadcast({'type': 'player_joined', 'player': self.players[pid]}, exclude=ws)
 
         try:
-            async for message in websocket:
-                data = json.loads(message)
-                p = self.players.get(pid)
-                if not p: continue
+            async for msg in ws:
+                if msg.type == WSMsgType.TEXT:
+                    data = json.loads(msg.data)
+                    p = self.players.get(pid)
+                    if not p: continue
 
-                if data["type"] == "set_nickname":
-                    p["nickname"] = data["name"][:12]
-                    await self.broadcast({"type": "update_stats", "id": pid, "player": p})
+                    if data["type"] == "set_nickname":
+                        p["nickname"] = data["name"][:12]
+                        await self.broadcast({"type": "update_stats", "id": pid, "player": p})
 
-                elif data["type"] == "start_trigger":
-                    count = len(self.players)
-                    new_size = 13 if count <= 2 else (19 if count >= 5 else 15)
-                    self.regenerate_map(new_size)
-                    self.game_started = True
-                    self.bombs = []
-                    idx = 0
-                    for pl in self.players.values():
-                        pl['x'], pl['y'] = self.get_start_pos(idx)
-                        idx += 1
-                    await self.broadcast({"type": "reset_game", "map": self.map, "players": self.players, "grid_size": new_size, "host_id": pid})
-                    await self.broadcast({"type": "start_game_signal"})
+                    elif data["type"] == "start_trigger":
+                        count = len(self.players)
+                        new_size = 13 if count <= 2 else (19 if count >= 5 else 15)
+                        self.regenerate_map(new_size)
+                        self.game_started = True
+                        self.bombs = []
+                        idx = 0
+                        for pl in self.players.values():
+                            pl['x'], pl['y'] = self.get_start_pos(idx)
+                            idx += 1
+                        await self.broadcast({"type": "reset_game", "map": self.map, "players": self.players, "grid_size": new_size, "host_id": pid})
+                        await self.broadcast({"type": "start_game_signal"})
 
-                elif data["type"] == "move" and p['alive']:
-                    gx, gy = int((data['x'] + 32) // 64), int((data['y'] + 32) // 64)
-                    if 0 <= gy < self.grid_size and 0 <= gx < self.grid_size:
-                        cell = self.map[gy][gx]
-                        if cell >= 3:
-                            kind = 'UNKNOWN'
-                            if cell == ITEM_FIRE: p['range'] += 1; kind = 'FIRE'
-                            elif cell == ITEM_SPEED: kind = 'SPEED'
-                            elif cell == ITEM_GHOST: p['ghost'] = True; kind = 'GHOST'
-                            elif cell == ITEM_KICK: p['kick'] = True; kind = 'KICK'
-                            elif cell == ITEM_AMMO: p['max_bombs'] += 1; kind = 'AMMO'
-                            self.map[gy][gx] = FLOOR
-                            await self.broadcast({'type': 'map_update', 'x': gx, 'y': gy, 'val': FLOOR})
-                            await self.broadcast({'type': 'powerup', 'id': pid, 'kind': kind})
+                    elif data["type"] == "move" and p['alive']:
+                        gx, gy = int((data['x'] + 32) // 64), int((data['y'] + 32) // 64)
+                        if 0 <= gy < self.grid_size and 0 <= gx < self.grid_size:
+                            cell = self.map[gy][gx]
+                            if cell >= 3:
+                                kind = 'UNKNOWN'
+                                if cell == ITEM_FIRE: p['range'] += 1; kind = 'FIRE'
+                                elif cell == ITEM_SPEED: kind = 'SPEED'
+                                elif cell == ITEM_GHOST: p['ghost'] = True; kind = 'GHOST'
+                                elif cell == ITEM_KICK: p['kick'] = True; kind = 'KICK'
+                                elif cell == ITEM_AMMO: p['max_bombs'] += 1; kind = 'AMMO'
+                                self.map[gy][gx] = FLOOR
+                                await self.broadcast({'type': 'map_update', 'x': gx, 'y': gy, 'val': FLOOR})
+                                await self.broadcast({'type': 'powerup', 'id': pid, 'kind': kind})
 
-                    if p['kick']:
-                        for b in self.bombs:
-                            dist = ((p['x'] - b['x'])**2 + (p['y'] - b['y'])**2)**0.5
-                            if dist < 40: 
-                                dx = b['x'] - p['x']; dy = b['y'] - p['y']
-                                if abs(dx) > abs(dy): b['vx'] = 1 if dx > 0 else -1; b['vy'] = 0
-                                else: b['vx'] = 0; b['vy'] = 1 if dy > 0 else -1
+                        if p['kick']:
+                            for b in self.bombs:
+                                dist = ((p['x'] - b['x'])**2 + (p['y'] - b['y'])**2)**0.5
+                                if dist < 40: 
+                                    dx = b['x'] - p['x']; dy = b['y'] - p['y']
+                                    if abs(dx) > abs(dy): b['vx'] = 1 if dx > 0 else -1; b['vy'] = 0
+                                    else: b['vx'] = 0; b['vy'] = 1 if dy > 0 else -1
 
-                    p["x"], p["y"] = data["x"], data["y"]
-                    await self.broadcast({"type": "update", "id": pid, "x": p["x"], "y": p["y"]}, exclude=websocket)
+                        p["x"], p["y"] = data["x"], data["y"]
+                        await self.broadcast({"type": "update", "id": pid, "x": p["x"], "y": p["y"]}, exclude=ws)
 
-                elif data["type"] == "bomb" and p['alive']:
-                    active_bombs = sum(1 for b in self.bombs if b['owner'] == pid)
-                    if active_bombs < p['max_bombs']:
-                        bx, by = data['x'], data['y']
-                        occupied = any(b['x'] == bx and b['y'] == by for b in self.bombs)
-                        if not occupied:
-                            new_bomb = {'x': bx, 'y': by, 'range': p['range'], 'owner': pid, 'vx': 0, 'vy': 0}
-                            self.bombs.append(new_bomb)
-                            asyncio.create_task(self.bomb_logic(new_bomb))
-                            await self.broadcast({"type": "bombs_update", "bombs": self.bombs})
+                    elif data["type"] == "bomb" and p['alive']:
+                        active_bombs = sum(1 for b in self.bombs if b['owner'] == pid)
+                        if active_bombs < p['max_bombs']:
+                            bx, by = data['x'], data['y']
+                            occupied = any(b['x'] == bx and b['y'] == by for b in self.bombs)
+                            if not occupied:
+                                new_bomb = {'x': bx, 'y': by, 'range': p['range'], 'owner': pid, 'vx': 0, 'vy': 0}
+                                self.bombs.append(new_bomb)
+                                asyncio.create_task(self.bomb_logic(new_bomb))
+                                await self.broadcast({"type": "bombs_update", "bombs": self.bombs})
+                
+                elif msg.type == WSMsgType.ERROR:
+                    print('ws connection closed with exception %s', ws.exception())
 
-        except: pass
-        finally: await self.handle_disconnect(websocket)
-
-# --- TU CÓDIGO SUGERIDO (Correcto para legacy API) ---
-async def process_request(path, request_headers):
-    # Responde OK a los health checks de Render o navegadores
-    if path == "/health" or path == "/":
-        return (
-            200,
-            Headers({"Content-Type": "text/plain"}),
-            b"OK"
-        )
-    return None
+        finally:
+            await self.handle_disconnect(ws)
+        
+        return ws
 
 async def main():
     PORT = int(os.environ.get("PORT", 10000))
-    print(f"🔥 Servidor V14 (Legacy Fix + HealthCheck) - Puerto {PORT}")
-    server = BombermanServer()
+    print(f"🔥 Servidor V15 (AIOHTTP Pro) - Puerto {PORT}")
     
-    # Usamos websockets.serve (API clásica) con tu process_request
-    async with websockets.serve(
-        server.handler, 
-        "0.0.0.0", 
-        PORT, 
-        process_request=process_request
-    ):
-        print("Esperando conexiones...")
-        await asyncio.Future()
+    server = BombermanServer()
+    app = web.Application()
+    # Ruta única que maneja tanto HTTP (Health Check) como WS (Juego)
+    app.add_routes([web.get('/', server.handle_request), web.get('/health', server.handle_request)])
+    
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', PORT)
+    await site.start()
+    
+    print("🚀 Servidor en línea (Inmune a Health Checks)")
+    await asyncio.Future() # Mantener vivo
 
 if __name__ == "__main__":
     asyncio.run(main())
