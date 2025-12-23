@@ -95,12 +95,10 @@ class GameRoom:
             })
             await self.check_win_condition()
 
-    # --- NUEVO: Desactiva el modo fantasma después de X segundos ---
     async def disable_ghost_later(self, pid, duration):
         await asyncio.sleep(duration)
         if pid in self.players and self.players[pid]['alive']:
             self.players[pid]['ghost'] = False
-            # Avisamos al cliente específicamente que se acabó
             await self.broadcast({
                 'type': 'powerup_expired', 
                 'id': pid, 
@@ -153,9 +151,14 @@ class GameRoom:
         except asyncio.CancelledError:
             pass
 
-    async def bomb_logic(self, bomb_obj):
+    async def bomb_timer(self, bomb_obj):
         await asyncio.sleep(3.0)
-        if bomb_obj not in self.bombs: return
+        await self.detonate(bomb_obj)
+
+    async def detonate(self, bomb_obj):
+        if bomb_obj not in self.bombs:
+            return 
+
         self.bombs.remove(bomb_obj)
         await self.broadcast({'type': 'bombs_update', 'bombs': self.bombs})
         
@@ -163,42 +166,59 @@ class GameRoom:
         brange = bomb_obj['range']
         gx, gy = int((bx+32) // 64), int((by+32) // 64)
         explosion_cells = []
-        directions = [(0,0), (0,-1), (0,1), (-1,0), (1,0)]
+        
+        explosion_cells.append({'x': gx * 64, 'y': gy * 64})
+        
+        directions = [(0,-1), (0,1), (-1,0), (1,0)] 
 
         for dx, dy in directions:
-            for i in range(brange if (dx, dy) != (0,0) else 1):
-                dist = i + 1 if (dx, dy) != (0,0) else 0
+            for i in range(brange):
+                dist = i + 1
                 tx, ty = gx + (dx * dist), gy + (dy * dist)
-                if 0 <= tx < self.grid_size and 0 <= ty < self.grid_size:
-                    cell = self.map[ty][tx]
-                    if cell == WALL_HARD: break
-                    explosion_cells.append({'x': tx * 64, 'y': ty * 64})
-                    
-                    for pid, p in self.players.items():
-                        px, py = int((p['x'] + 32) // 64), int((p['y'] + 32) // 64)
-                        if px == tx and py == ty and p['alive']:
-                            p['alive'] = False
-                            await self.broadcast({'type': 'player_killed', 'id': pid})
-                            asyncio.create_task(self.check_win_condition())
+                
+                if not (0 <= tx < self.grid_size and 0 <= ty < self.grid_size):
+                    break
+                
+                cell = self.map[ty][tx]
+                
+                if cell == WALL_HARD: 
+                    break
+                
+                explosion_cells.append({'x': tx * 64, 'y': ty * 64})
 
-                    for other_b in self.bombs[:]:
-                        obx, oby = int((other_b['x']+32)//64), int((other_b['y']+32)//64)
-                        if obx == tx and oby == ty:
-                            self.bombs.remove(other_b)
-                            await self.broadcast({'type': 'bombs_update', 'bombs': self.bombs})
-                            asyncio.create_task(self.bomb_logic(other_b))
+                if cell == WALL_SOFT:
+                    drop = FLOOR
+                    roll = random.random()
+                    if roll < 0.20: drop = ITEM_FIRE
+                    elif roll < 0.35: drop = ITEM_SPEED
+                    elif roll < 0.45: drop = ITEM_AMMO
+                    elif roll < 0.50: drop = ITEM_KICK
+                    elif roll < 0.55: drop = ITEM_GHOST
+                    self.map[ty][tx] = drop
+                    await self.broadcast({'type': 'map_update', 'x': tx, 'y': ty, 'val': drop})
+                    break 
 
-                    if cell == WALL_SOFT:
-                        drop = FLOOR
-                        roll = random.random()
-                        if roll < 0.20: drop = ITEM_FIRE
-                        elif roll < 0.35: drop = ITEM_SPEED
-                        elif roll < 0.45: drop = ITEM_AMMO
-                        elif roll < 0.50: drop = ITEM_KICK
-                        elif roll < 0.55: drop = ITEM_GHOST
-                        self.map[ty][tx] = drop
-                        await self.broadcast({'type': 'map_update', 'x': tx, 'y': ty, 'val': drop})
-                        break
+                for other_b in self.bombs[:]: 
+                    obx, oby = int((other_b['x']+32)//64), int((other_b['y']+32)//64)
+                    if obx == tx and oby == ty:
+                        asyncio.create_task(self.detonate(other_b))
+
+        for pid, p in self.players.items():
+            if not p['alive']: continue
+            px, py = int((p['x'] + 32) // 64), int((p['y'] + 32) // 64)
+            
+            hit = False
+            for c in explosion_cells:
+                cx, cy = int(c['x'] // 64), int(c['y'] // 64)
+                if px == cx and py == cy:
+                    hit = True
+                    break
+            
+            if hit:
+                p['alive'] = False
+                await self.broadcast({'type': 'player_killed', 'id': pid})
+                asyncio.create_task(self.check_win_condition())
+
         await self.broadcast({'type': 'explosion', 'cells': explosion_cells})
 
     async def check_win_condition(self):
@@ -307,11 +327,9 @@ async def handle_request(request):
                                     kind = 'UNKNOWN'
                                     if cell == ITEM_FIRE: p['range'] += 1; kind = 'FIRE'
                                     elif cell == ITEM_SPEED: kind = 'SPEED'
-                                    # LOGICA DEL GHOST TEMPORAL
                                     elif cell == ITEM_GHOST: 
                                         p['ghost'] = True
                                         kind = 'GHOST'
-                                        # Inicia temporizador de 15 segundos
                                         asyncio.create_task(current_room.disable_ghost_later(pid, 15))
                                     elif cell == ITEM_KICK: p['kick'] = True; kind = 'KICK'
                                     elif cell == ITEM_AMMO: p['max_bombs'] += 1; kind = 'AMMO'
@@ -319,13 +337,38 @@ async def handle_request(request):
                                     await current_room.broadcast({'type': 'map_update', 'x': gx, 'y': gy, 'val': FLOOR})
                                     await current_room.broadcast({'type': 'powerup', 'id': pid, 'kind': kind})
 
+                            # --- LÓGICA DE KICK MEJORADA ---
                             if p['kick']:
                                 for b in current_room.bombs:
                                     dist = ((p['x'] - b['x'])**2 + (p['y'] - b['y'])**2)**0.5
-                                    if dist < 40: 
-                                        dx = b['x'] - p['x']; dy = b['y'] - p['y']
-                                        if abs(dx) > abs(dy): b['vx'] = 1 if dx > 0 else -1; b['vy'] = 0
-                                        else: b['vx'] = 0; b['vy'] = 1 if dy > 0 else -1
+                                    
+                                    # 1. Zona Muerta: Si estás MUY cerca (dentro), no patear.
+                                    # Esto permite poner la bomba y salir de ella sin empujarla.
+                                    if dist < 30: 
+                                        continue
+
+                                    # 2. Zona de Activación: Si estás tocando el borde.
+                                    if dist < 50: 
+                                        # 3. Verificación de Vector: ¿Me muevo HACIA la bomba o ALEJÁNDOME?
+                                        move_dx = data['x'] - p['x']
+                                        move_dy = data['y'] - p['y']
+                                        
+                                        to_bomb_x = b['x'] - p['x']
+                                        to_bomb_y = b['y'] - p['y']
+                                        
+                                        # Producto Punto
+                                        dot = (move_dx * to_bomb_x) + (move_dy * to_bomb_y)
+                                        
+                                        # Solo si nos movemos HACIA ella (dot > 0) la pateamos
+                                        if dot > 0:
+                                            dx = b['x'] - p['x']
+                                            dy = b['y'] - p['y']
+                                            if abs(dx) > abs(dy): 
+                                                b['vx'] = 1 if dx > 0 else -1
+                                                b['vy'] = 0
+                                            else: 
+                                                b['vx'] = 0
+                                                b['vy'] = 1 if dy > 0 else -1
 
                             p["x"], p["y"] = data["x"], data["y"]
                             await current_room.broadcast({"type": "update", "id": pid, "x": p["x"], "y": p["y"]}, exclude=ws)
@@ -338,7 +381,7 @@ async def handle_request(request):
                                 if not occ:
                                     nb = {'x': bx, 'y': by, 'range': p['range'], 'owner': pid, 'vx': 0, 'vy': 0}
                                     current_room.bombs.append(nb)
-                                    asyncio.create_task(current_room.bomb_logic(nb))
+                                    asyncio.create_task(current_room.bomb_timer(nb))
                                     await current_room.broadcast({"type": "bombs_update", "bombs": current_room.bombs})
 
     finally:
@@ -353,7 +396,7 @@ async def handle_request(request):
 
 async def main():
     PORT = int(os.environ.get("PORT", 10000))
-    print(f"🔥 Servidor V21 (GhostTimer + Mobile) - Puerto {PORT}")
+    print(f"🔥 Servidor V24 (Smart Kick) - Puerto {PORT}")
     
     app = web.Application()
     app.add_routes([web.get('/', handle_request), web.get('/health', handle_request)])
