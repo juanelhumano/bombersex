@@ -30,21 +30,45 @@ class BombermanServer:
     def regenerate_map(self, size):
         self.grid_size = size
         self.map = [[0 for _ in range(size)] for _ in range(size)]
+        
+        # 1. Generación Base
         for y in range(size):
             for x in range(size):
                 if x == 0 or x == size-1 or y == 0 or y == size-1:
                     self.map[y][x] = WALL_HARD
                 elif x % 2 == 0 and y % 2 == 0:
                     self.map[y][x] = WALL_HARD
-                elif random.random() < 0.45 and not ((x < 3 and y < 3) or (x > size-4 and y > size-4)): 
+                elif random.random() < 0.45: 
                     self.map[y][x] = WALL_SOFT
+                else:
+                    self.map[y][x] = FLOOR
+
+        # 2. LIMPIEZA DE SEGURIDAD (Spawn Zones)
+        # Aseguramos que las 4 esquinas y sus vecinos sean SIEMPRE suelo.
+        # Esto evita que los jugadores 2, 3 y 4 nazcan atrapados.
+        safe_spots = [
+            # Jugador 1 (Top-Left)
+            (1, 1), (1, 2), (2, 1),
+            # Jugador 2 (Top-Right)
+            (1, size-2), (1, size-3), (2, size-2),
+            # Jugador 3 (Bottom-Left)
+            (size-2, 1), (size-2, 2), (size-3, 1),
+            # Jugador 4 (Bottom-Right)
+            (size-2, size-2), (size-2, size-3), (size-3, size-2)
+        ]
+        
+        for (r, c) in safe_spots:
+            if 0 <= r < size and 0 <= c < size:
+                self.map[r][c] = FLOOR
     
     def get_start_pos(self, index):
         s = self.grid_size
+        # Coordenadas exactas en píxeles (Tile = 64px)
+        # (1,1), (1, size-2), (size-2, 1), (size-2, size-2)
         c1 = (64, 64)
-        c2 = (s*64 - 128, 64)
-        c3 = (64, s*64 - 128)
-        c4 = (s*64 - 128, s*64 - 128)
+        c2 = ((s-2)*64, 64)
+        c3 = (64, (s-2)*64)
+        c4 = ((s-2)*64, (s-2)*64)
         corners = [c1, c2, c3, c4]
         return corners[index % 4]
 
@@ -55,7 +79,6 @@ class BombermanServer:
         for ws in list(self.clients.keys()):
             if ws != exclude:
                 try: 
-                    # aiohttp usa send_str
                     await ws.send_str(data)
                 except: 
                     disconnected.append(ws)
@@ -174,17 +197,13 @@ class BombermanServer:
                 idx += 1
             await self.broadcast({"type": "reset_game", "map": self.map, "players": self.players, "grid_size": self.grid_size, "host_id": list(self.players.keys())[0]})
 
-    # --- HANDLER PARA AIOHTTP (Maneja HTTP y WS) ---
     async def handle_request(self, request):
-        # 1. Si es Health Check (HTTP), responde OK
         if request.headers.get('Upgrade', '').lower() != 'websocket':
             return web.Response(text="OK - Bomberman Server Running")
 
-        # 2. Si es WebSocket, inicia la conexión
         ws = web.WebSocketResponse()
         await ws.prepare(request)
 
-        # Si el juego ya empezó, rechazar conexión
         if self.game_started:
             await ws.send_json({
                 "type": "error", "message": "⚠️ PARTIDA EN CURSO ⚠️\nEspera a que termine la ronda."
@@ -192,7 +211,6 @@ class BombermanServer:
             await ws.close()
             return ws
 
-        # Inicialización de jugador
         pid = str(uuid.uuid4())[:8]
         self.clients[ws] = pid
         pos = self.get_start_pos(len(self.players))
@@ -282,11 +300,10 @@ class BombermanServer:
 
 async def main():
     PORT = int(os.environ.get("PORT", 10000))
-    print(f"🔥 Servidor V15 (AIOHTTP Pro) - Puerto {PORT}")
+    print(f"🔥 Servidor V16 (SpawnFix) - Puerto {PORT}")
     
     server = BombermanServer()
     app = web.Application()
-    # Ruta única que maneja tanto HTTP (Health Check) como WS (Juego)
     app.add_routes([web.get('/', server.handle_request), web.get('/health', server.handle_request)])
     
     runner = web.AppRunner(app)
@@ -294,8 +311,8 @@ async def main():
     site = web.TCPSite(runner, '0.0.0.0', PORT)
     await site.start()
     
-    print("🚀 Servidor en línea (Inmune a Health Checks)")
-    await asyncio.Future() # Mantener vivo
+    print("🚀 Servidor en línea")
+    await asyncio.Future()
 
 if __name__ == "__main__":
     asyncio.run(main())
