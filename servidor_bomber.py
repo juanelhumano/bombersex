@@ -31,39 +31,65 @@ class GameRoom:
         if self.physics_task:
             self.physics_task.cancel()
 
+    # --- NUEVO: Calcula las coordenadas lógicas (Grid) de los 8 spawns ---
+    def get_spawn_grid_coords(self, size):
+        mid = size // 2
+        # Lista de 8 posiciones (Columna X, Fila Y)
+        # Orden: Esquinas primero, luego centros (para balancear si son 5 o 6)
+        spawns = [
+            (1, 1),                 # 1. Top-Izquierda
+            (size-2, size-2),       # 2. Bottom-Derecha
+            (size-2, 1),            # 3. Top-Derecha
+            (1, size-2),            # 4. Bottom-Izquierda
+            (mid, 1),               # 5. Top-Centro
+            (mid, size-2),          # 6. Bottom-Centro
+            (1, mid),               # 7. Izquierda-Centro
+            (size-2, mid)           # 8. Derecha-Centro
+        ]
+        return spawns
+
     def regenerate_map(self, size):
         self.grid_size = size
         self.map = [[0 for _ in range(size)] for _ in range(size)]
         
+        # 1. Obtener puntos de spawn para protegerlos
+        spawn_points = self.get_spawn_grid_coords(size)
+        
+        # Crear set de zonas prohibidas (Spawn + sus vecinos directos)
+        safe_zone = set()
+        for (sx, sy) in spawn_points:
+            safe_zone.add((sx, sy))
+            safe_zone.add((sx+1, sy))
+            safe_zone.add((sx-1, sy))
+            safe_zone.add((sx, sy+1))
+            safe_zone.add((sx, sy-1))
+
+        # 2. Generación del Mapa
         for y in range(size):
             for x in range(size):
+                # Bordes sólidos
                 if x == 0 or x == size-1 or y == 0 or y == size-1:
                     self.map[y][x] = WALL_HARD
+                # Pilares sólidos internos
                 elif x % 2 == 0 and y % 2 == 0:
                     self.map[y][x] = WALL_HARD
-                elif random.random() < 0.45: 
-                    self.map[y][x] = WALL_SOFT
                 else:
-                    self.map[y][x] = FLOOR
+                    # Si es zona segura, FORZAR SUELO
+                    if (x, y) in safe_zone:
+                        self.map[y][x] = FLOOR
+                    # Si no, azar para bloque blando
+                    elif random.random() < 0.50: # Subí un poco la densidad para mapas grandes
+                        self.map[y][x] = WALL_SOFT
+                    else:
+                        self.map[y][x] = FLOOR
 
-        safe_spots = [
-            (1, 1), (1, 2), (2, 1),
-            (1, size-2), (1, size-3), (2, size-2),
-            (size-2, 1), (size-2, 2), (size-3, 1),
-            (size-2, size-2), (size-2, size-3), (size-3, size-2)
-        ]
-        for (r, c) in safe_spots:
-            if 0 <= r < size and 0 <= c < size:
-                self.map[r][c] = FLOOR
-    
+    # --- NUEVO: Obtiene posición en PIXELES basada en los spawns ---
     def get_start_pos(self, index):
-        s = self.grid_size
-        c1 = (64, 64)
-        c2 = ((s-2)*64, 64)
-        c3 = (64, (s-2)*64)
-        c4 = ((s-2)*64, (s-2)*64)
-        corners = [c1, c2, c3, c4]
-        return corners[index % 4]
+        # Usamos modulo 8 para ciclar entre las 8 posiciones
+        spawns = self.get_spawn_grid_coords(self.grid_size)
+        idx = index % len(spawns)
+        gx, gy = spawns[idx]
+        return (gx * 64, gy * 64)
 
     async def broadcast(self, message, exclude=None):
         if not self.clients: return
@@ -280,7 +306,7 @@ async def handle_request(request):
                 current_room.clients[ws] = pid
                 
                 pos = current_room.get_start_pos(len(current_room.players))
-                colors = ["#ef4444", "#3b82f6", "#22c55e", "#eab308", "#a855f7", "#ec4899"]
+                colors = ["#ef4444", "#3b82f6", "#22c55e", "#eab308", "#a855f7", "#ec4899", "#06b6d4", "#f97316"]
                 
                 current_room.players[pid] = {
                     "id": pid, "nickname": login_data.get('nickname', 'Player')[:12],
@@ -341,35 +367,23 @@ async def handle_request(request):
                             if p['kick']:
                                 for b in current_room.bombs:
                                     dist = ((p['x'] - b['x'])**2 + (p['y'] - b['y'])**2)**0.5
-                                    
-                                    # 1. Zona Muerta (Ajustada a 28px): Si estás "dentro", no patear.
                                     if dist < 28: 
                                         continue
-
-                                    # 2. Zona de Activación (60px): Tocar bordes
                                     if dist < 60: 
-                                        # 3. USA EL INPUT (TECLADO) PARA DECIDIR
-                                        # data['dx'] y data['dy'] vienen directo del teclado (-1, 0, 1)
-                                        # Esto funciona aunque el jugador esté "bloqueado" físicamente.
                                         input_dx = data.get('dx', 0)
                                         input_dy = data.get('dy', 0)
 
                                         if input_dx == 0 and input_dy == 0:
-                                            continue # No hay intención de movimiento
+                                            continue 
 
                                         to_bomb_x = b['x'] - p['x']
                                         to_bomb_y = b['y'] - p['y']
-                                        
-                                        # Producto Punto con la dirección de INPUT
                                         dot = (input_dx * to_bomb_x) + (input_dy * to_bomb_y)
                                         
                                         if dot > 0:
-                                            # Patear en la dirección del INPUT
                                             b['vx'] = input_dx
                                             b['vy'] = input_dy
-                                            # Normalizar si es diagonal (aunque el input suele ser cardinal)
                                             if b['vx'] != 0 and b['vy'] != 0:
-                                                # Priorizar eje dominante o anular diagonal
                                                 if abs(to_bomb_x) > abs(to_bomb_y): b['vy'] = 0
                                                 else: b['vx'] = 0
 
@@ -399,7 +413,7 @@ async def handle_request(request):
 
 async def main():
     PORT = int(os.environ.get("PORT", 10000))
-    print(f"🔥 Servidor V25 (Input Kick) - Puerto {PORT}")
+    print(f"🔥 Servidor V26 (8 Players) - Puerto {PORT}")
     
     app = web.Application()
     app.add_routes([web.get('/', handle_request), web.get('/health', handle_request)])
