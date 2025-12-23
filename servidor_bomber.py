@@ -3,6 +3,7 @@ import json
 import websockets
 import uuid
 import random
+import os  # ✅ Import necesario para leer variables de entorno
 
 # Constantes base
 WALL_HARD = 1
@@ -40,8 +41,6 @@ class BombermanServer:
     
     def get_start_pos(self, index):
         s = self.grid_size
-        # CORREGIDO: Coordenadas exactas (Tile 1,1) -> 64,64
-        # Antes (96,96) causaba solapamiento con el tile (2,2)
         c1 = (64, 64)
         c2 = (s*64 - 128, 64)
         c3 = (64, s*64 - 128)
@@ -66,7 +65,6 @@ class BombermanServer:
             if pid in self.players:
                 del self.players[pid]
             
-            # Si se va el host, asignar nuevo
             new_host = list(self.players.keys())[0] if self.players else None
             
             await self.broadcast({
@@ -178,6 +176,13 @@ class BombermanServer:
             await self.broadcast({"type": "reset_game", "map": self.map, "players": self.players, "grid_size": self.grid_size, "host_id": list(self.players.keys())[0]})
 
     async def handler(self, websocket):
+        if self.game_started:
+            await websocket.send(json.dumps({
+                "type": "error", 
+                "message": "⚠️ PARTIDA EN CURSO ⚠️\nEspera a que termine la ronda."
+            }))
+            return 
+
         pid = str(uuid.uuid4())[:8]
         self.clients[websocket] = pid
         pos = self.get_start_pos(len(self.players))
@@ -221,7 +226,6 @@ class BombermanServer:
                     await self.broadcast({"type": "start_game_signal"})
 
                 elif data["type"] == "move" and p['alive']:
-                    # Item check
                     gx, gy = int((data['x'] + 32) // 64), int((data['y'] + 32) // 64)
                     if 0 <= gy < self.grid_size and 0 <= gx < self.grid_size:
                         cell = self.map[gy][gx]
@@ -262,9 +266,13 @@ class BombermanServer:
         finally: await self.handle_disconnect(websocket)
 
 async def main():
-    print("🔥 Servidor V8 (Corregido) - Puerto 8080")
+    # ✅ CONFIGURACIÓN PARA RENDER
+    # Obtiene el puerto del sistema o usa 10000 por defecto
+    PORT = int(os.environ.get("PORT", 10000))
+    print(f"🔥 Servidor Bomberman V10 - Puerto {PORT}")
+    print("   (Render Ready)")
     server = BombermanServer()
-    async with websockets.serve(server.handler, "0.0.0.0", 8080):
+    async with websockets.serve(server.handler, "0.0.0.0", PORT):
         print("Esperando conexiones...")
         await asyncio.Future()
 
