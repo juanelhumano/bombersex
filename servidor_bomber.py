@@ -337,38 +337,41 @@ async def handle_request(request):
                                     await current_room.broadcast({'type': 'map_update', 'x': gx, 'y': gy, 'val': FLOOR})
                                     await current_room.broadcast({'type': 'powerup', 'id': pid, 'kind': kind})
 
-                            # --- LÓGICA DE KICK MEJORADA ---
+                            # --- LÓGICA DE KICK DEFINITIVA ---
                             if p['kick']:
                                 for b in current_room.bombs:
                                     dist = ((p['x'] - b['x'])**2 + (p['y'] - b['y'])**2)**0.5
                                     
-                                    # 1. Zona Muerta: Si estás MUY cerca (dentro), no patear.
-                                    # Esto permite poner la bomba y salir de ella sin empujarla.
-                                    if dist < 30: 
+                                    # 1. Zona Muerta (Ajustada a 28px): Si estás "dentro", no patear.
+                                    if dist < 28: 
                                         continue
 
-                                    # 2. Zona de Activación: Si estás tocando el borde.
-                                    if dist < 50: 
-                                        # 3. Verificación de Vector: ¿Me muevo HACIA la bomba o ALEJÁNDOME?
-                                        move_dx = data['x'] - p['x']
-                                        move_dy = data['y'] - p['y']
-                                        
+                                    # 2. Zona de Activación (60px): Tocar bordes
+                                    if dist < 60: 
+                                        # 3. USA EL INPUT (TECLADO) PARA DECIDIR
+                                        # data['dx'] y data['dy'] vienen directo del teclado (-1, 0, 1)
+                                        # Esto funciona aunque el jugador esté "bloqueado" físicamente.
+                                        input_dx = data.get('dx', 0)
+                                        input_dy = data.get('dy', 0)
+
+                                        if input_dx == 0 and input_dy == 0:
+                                            continue # No hay intención de movimiento
+
                                         to_bomb_x = b['x'] - p['x']
                                         to_bomb_y = b['y'] - p['y']
                                         
-                                        # Producto Punto
-                                        dot = (move_dx * to_bomb_x) + (move_dy * to_bomb_y)
+                                        # Producto Punto con la dirección de INPUT
+                                        dot = (input_dx * to_bomb_x) + (input_dy * to_bomb_y)
                                         
-                                        # Solo si nos movemos HACIA ella (dot > 0) la pateamos
                                         if dot > 0:
-                                            dx = b['x'] - p['x']
-                                            dy = b['y'] - p['y']
-                                            if abs(dx) > abs(dy): 
-                                                b['vx'] = 1 if dx > 0 else -1
-                                                b['vy'] = 0
-                                            else: 
-                                                b['vx'] = 0
-                                                b['vy'] = 1 if dy > 0 else -1
+                                            # Patear en la dirección del INPUT
+                                            b['vx'] = input_dx
+                                            b['vy'] = input_dy
+                                            # Normalizar si es diagonal (aunque el input suele ser cardinal)
+                                            if b['vx'] != 0 and b['vy'] != 0:
+                                                # Priorizar eje dominante o anular diagonal
+                                                if abs(to_bomb_x) > abs(to_bomb_y): b['vy'] = 0
+                                                else: b['vx'] = 0
 
                             p["x"], p["y"] = data["x"], data["y"]
                             await current_room.broadcast({"type": "update", "id": pid, "x": p["x"], "y": p["y"]}, exclude=ws)
@@ -396,7 +399,7 @@ async def handle_request(request):
 
 async def main():
     PORT = int(os.environ.get("PORT", 10000))
-    print(f"🔥 Servidor V24 (Smart Kick) - Puerto {PORT}")
+    print(f"🔥 Servidor V25 (Input Kick) - Puerto {PORT}")
     
     app = web.Application()
     app.add_routes([web.get('/', handle_request), web.get('/health', handle_request)])
