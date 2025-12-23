@@ -1,10 +1,11 @@
 import asyncio
 import json
-import websockets
 import uuid
 import random
 import os
-import http # Necesario para responder a Health Checks HTTP
+# Importaciones específicas para la nueva versión de websockets (Python 3.13+)
+from websockets.asyncio.server import serve
+from websockets.http import Headers, Response
 
 # Constantes base
 WALL_HARD = 1
@@ -170,14 +171,6 @@ class BombermanServer:
                 idx += 1
             await self.broadcast({"type": "reset_game", "map": self.map, "players": self.players, "grid_size": self.grid_size, "host_id": list(self.players.keys())[0]})
 
-    # --- NUEVO: Manejador de peticiones HTTP para Health Checks ---
-    async def process_request(self, connection, request):
-        # Si recibimos una petición a /health o /, respondemos "OK" en vez de fallar
-        if request.path == "/health" or request.path == "/":
-            return http.HTTPStatus.OK, [], b"OK"
-        # Si no es health check, devolvemos None para que websockets continúe con la conexión normal
-        return None
-
     async def handler(self, websocket):
         if self.game_started:
             await websocket.send(json.dumps({
@@ -266,12 +259,23 @@ class BombermanServer:
         except: pass
         finally: await self.handle_disconnect(websocket)
 
+# Nueva función para manejar peticiones HTTP/Health Checks
+async def process_request(connection, request):
+    if request.path == "/health" or request.path == "/":
+        return Response(
+            200,
+            "OK",
+            Headers({"Content-Type": "text/plain"}),
+            b"OK"
+        )
+    return None
+
 async def main():
     PORT = int(os.environ.get("PORT", 10000))
-    print(f"🔥 Servidor V11 (Cloud Robust) - Puerto {PORT}")
+    print(f"🔥 Servidor V12 (Render Fix) - Puerto {PORT}")
     server = BombermanServer()
-    # Agregamos process_request para manejar Health Checks
-    async with websockets.serve(server.handler, "0.0.0.0", PORT, process_request=server.process_request):
+    # Usamos la nueva sintaxis 'serve' de websockets.asyncio
+    async with serve(server.handler, "0.0.0.0", PORT, process_request=process_request):
         print("Esperando conexiones...")
         await asyncio.Future()
 
