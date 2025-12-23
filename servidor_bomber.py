@@ -15,8 +15,10 @@ ITEM_GHOST = 5
 ITEM_KICK = 6 
 ITEM_AMMO = 7
 
-class BombermanServer:
-    def __init__(self):
+# --- CLASE DE UNA SALA DE JUEGO INDIVIDUAL ---
+class GameRoom:
+    def __init__(self, room_id):
+        self.room_id = room_id
         self.clients = {} # ws -> pid
         self.players = {} # pid -> data
         self.game_started = False
@@ -24,8 +26,13 @@ class BombermanServer:
         self.map = []
         self.bombs = [] 
         self.regenerate_map(15)
-        
-        asyncio.create_task(self.physics_loop())
+        # Iniciamos la física de ESTA sala
+        self.physics_task = asyncio.create_task(self.physics_loop())
+
+    def stop(self):
+        # Limpieza para no dejar procesos zombie
+        if self.physics_task:
+            self.physics_task.cancel()
 
     def regenerate_map(self, size):
         self.grid_size = size
@@ -44,27 +51,18 @@ class BombermanServer:
                     self.map[y][x] = FLOOR
 
         # 2. LIMPIEZA DE SEGURIDAD (Spawn Zones)
-        # Aseguramos que las 4 esquinas y sus vecinos sean SIEMPRE suelo.
-        # Esto evita que los jugadores 2, 3 y 4 nazcan atrapados.
         safe_spots = [
-            # Jugador 1 (Top-Left)
             (1, 1), (1, 2), (2, 1),
-            # Jugador 2 (Top-Right)
             (1, size-2), (1, size-3), (2, size-2),
-            # Jugador 3 (Bottom-Left)
             (size-2, 1), (size-2, 2), (size-3, 1),
-            # Jugador 4 (Bottom-Right)
             (size-2, size-2), (size-2, size-3), (size-3, size-2)
         ]
-        
         for (r, c) in safe_spots:
             if 0 <= r < size and 0 <= c < size:
                 self.map[r][c] = FLOOR
     
     def get_start_pos(self, index):
         s = self.grid_size
-        # Coordenadas exactas en píxeles (Tile = 64px)
-        # (1,1), (1, size-2), (size-2, 1), (size-2, size-2)
         c1 = (64, 64)
         c2 = ((s-2)*64, 64)
         c3 = (64, (s-2)*64)
@@ -103,34 +101,37 @@ class BombermanServer:
             await self.check_win_condition()
 
     async def physics_loop(self):
-        while True:
-            await asyncio.sleep(0.05)
-            if not self.bombs: continue
-            
-            moved = False
-            for b in self.bombs:
-                if b.get('vx', 0) != 0 or b.get('vy', 0) != 0:
-                    new_x = b['x'] + b['vx'] * 16
-                    new_y = b['y'] + b['vy'] * 16
-                    
-                    gx = int((new_x + 32) // 64)
-                    gy = int((new_y + 32) // 64)
-                    
-                    if 0 <= gx < self.grid_size and 0 <= gy < self.grid_size:
-                        if self.map[gy][gx] != FLOOR:
-                            b['vx'] = 0; b['vy'] = 0
-                            b['x'] = round(b['x'] / 64) * 64
-                            b['y'] = round(b['y'] / 64) * 64
-                            moved = True
+        try:
+            while True:
+                await asyncio.sleep(0.05)
+                if not self.bombs: continue
+                
+                moved = False
+                for b in self.bombs:
+                    if b.get('vx', 0) != 0 or b.get('vy', 0) != 0:
+                        new_x = b['x'] + b['vx'] * 16
+                        new_y = b['y'] + b['vy'] * 16
+                        
+                        gx = int((new_x + 32) // 64)
+                        gy = int((new_y + 32) // 64)
+                        
+                        if 0 <= gx < self.grid_size and 0 <= gy < self.grid_size:
+                            if self.map[gy][gx] != FLOOR:
+                                b['vx'] = 0; b['vy'] = 0
+                                b['x'] = round(b['x'] / 64) * 64
+                                b['y'] = round(b['y'] / 64) * 64
+                                moved = True
+                            else:
+                                b['x'] = new_x
+                                b['y'] = new_y
+                                moved = True
                         else:
-                            b['x'] = new_x
-                            b['y'] = new_y
-                            moved = True
-                    else:
-                        b['vx'] = 0; b['vy'] = 0
-            
-            if moved:
-                await self.broadcast({'type': 'bombs_update', 'bombs': self.bombs})
+                            b['vx'] = 0; b['vy'] = 0
+                
+                if moved:
+                    await self.broadcast({'type': 'bombs_update', 'bombs': self.bombs})
+        except asyncio.CancelledError:
+            pass
 
     async def bomb_logic(self, bomb_obj):
         await asyncio.sleep(3.0)
@@ -197,121 +198,167 @@ class BombermanServer:
                 idx += 1
             await self.broadcast({"type": "reset_game", "map": self.map, "players": self.players, "grid_size": self.grid_size, "host_id": list(self.players.keys())[0]})
 
-    async def handle_request(self, request):
-        if request.headers.get('Upgrade', '').lower() != 'websocket':
-            return web.Response(text="OK - Bomberman Server Running")
 
-        ws = web.WebSocketResponse()
-        await ws.prepare(request)
+# --- GESTOR DE SALAS Y CONEXIONES ---
+active_rooms = {} # id -> GameRoom
 
-        if self.game_started:
-            await ws.send_json({
-                "type": "error", "message": "⚠️ PARTIDA EN CURSO ⚠️\nEspera a que termine la ronda."
-            })
-            await ws.close()
-            return ws
+async def handle_request(request):
+    # Health Check
+    if request.headers.get('Upgrade', '').lower() != 'websocket':
+        return web.Response(text=f"BomberServer OK - {len(active_rooms)} Rooms Active")
 
-        pid = str(uuid.uuid4())[:8]
-        self.clients[ws] = pid
-        pos = self.get_start_pos(len(self.players))
-        colors = ["#ef4444", "#3b82f6", "#22c55e", "#eab308", "#a855f7", "#ec4899"]
+    ws = web.WebSocketResponse()
+    await ws.prepare(request)
+
+    # ESPERAR EL PRIMER MENSAJE DE LOGIN (Crear o Unirse)
+    try:
+        current_room = None
         
-        self.players[pid] = {
-            "id": pid, "nickname": f"Player {pid[:4]}",
-            "x": pos[0], "y": pos[1], "color": colors[len(self.players) % len(colors)],
-            "alive": True, "range": 1, "max_bombs": 1, "ghost": False, "kick": False
-        }
-        
-        await ws.send_json({
-            "type": "init", "id": pid, "players": self.players, 
-            "map": self.map, "game_started": self.game_started, 
-            "host_id": list(self.players.keys())[0], "grid_size": self.grid_size
-        })
-        await self.broadcast({'type': 'player_joined', 'player': self.players[pid]}, exclude=ws)
-
-        try:
-            async for msg in ws:
-                if msg.type == WSMsgType.TEXT:
-                    data = json.loads(msg.data)
-                    p = self.players.get(pid)
-                    if not p: continue
-
-                    if data["type"] == "set_nickname":
-                        p["nickname"] = data["name"][:12]
-                        await self.broadcast({"type": "update_stats", "id": pid, "player": p})
-
-                    elif data["type"] == "start_trigger":
-                        count = len(self.players)
-                        new_size = 13 if count <= 2 else (19 if count >= 5 else 15)
-                        self.regenerate_map(new_size)
-                        self.game_started = True
-                        self.bombs = []
-                        idx = 0
-                        for pl in self.players.values():
-                            pl['x'], pl['y'] = self.get_start_pos(idx)
-                            idx += 1
-                        await self.broadcast({"type": "reset_game", "map": self.map, "players": self.players, "grid_size": new_size, "host_id": pid})
-                        await self.broadcast({"type": "start_game_signal"})
-
-                    elif data["type"] == "move" and p['alive']:
-                        gx, gy = int((data['x'] + 32) // 64), int((data['y'] + 32) // 64)
-                        if 0 <= gy < self.grid_size and 0 <= gx < self.grid_size:
-                            cell = self.map[gy][gx]
-                            if cell >= 3:
-                                kind = 'UNKNOWN'
-                                if cell == ITEM_FIRE: p['range'] += 1; kind = 'FIRE'
-                                elif cell == ITEM_SPEED: kind = 'SPEED'
-                                elif cell == ITEM_GHOST: p['ghost'] = True; kind = 'GHOST'
-                                elif cell == ITEM_KICK: p['kick'] = True; kind = 'KICK'
-                                elif cell == ITEM_AMMO: p['max_bombs'] += 1; kind = 'AMMO'
-                                self.map[gy][gx] = FLOOR
-                                await self.broadcast({'type': 'map_update', 'x': gx, 'y': gy, 'val': FLOOR})
-                                await self.broadcast({'type': 'powerup', 'id': pid, 'kind': kind})
-
-                        if p['kick']:
-                            for b in self.bombs:
-                                dist = ((p['x'] - b['x'])**2 + (p['y'] - b['y'])**2)**0.5
-                                if dist < 40: 
-                                    dx = b['x'] - p['x']; dy = b['y'] - p['y']
-                                    if abs(dx) > abs(dy): b['vx'] = 1 if dx > 0 else -1; b['vy'] = 0
-                                    else: b['vx'] = 0; b['vy'] = 1 if dy > 0 else -1
-
-                        p["x"], p["y"] = data["x"], data["y"]
-                        await self.broadcast({"type": "update", "id": pid, "x": p["x"], "y": p["y"]}, exclude=ws)
-
-                    elif data["type"] == "bomb" and p['alive']:
-                        active_bombs = sum(1 for b in self.bombs if b['owner'] == pid)
-                        if active_bombs < p['max_bombs']:
-                            bx, by = data['x'], data['y']
-                            occupied = any(b['x'] == bx and b['y'] == by for b in self.bombs)
-                            if not occupied:
-                                new_bomb = {'x': bx, 'y': by, 'range': p['range'], 'owner': pid, 'vx': 0, 'vy': 0}
-                                self.bombs.append(new_bomb)
-                                asyncio.create_task(self.bomb_logic(new_bomb))
-                                await self.broadcast({"type": "bombs_update", "bombs": self.bombs})
+        # Leemos el primer mensaje para saber qué quiere hacer el cliente
+        msg = await ws.receive()
+        if msg.type == WSMsgType.TEXT:
+            login_data = json.loads(msg.data)
+            
+            # --- CREAR SALA ---
+            if login_data['action'] == 'CREATE':
+                # Generar ID de 4 dígitos
+                room_id = str(random.randint(1000, 9999))
+                while room_id in active_rooms:
+                    room_id = str(random.randint(1000, 9999))
                 
-                elif msg.type == WSMsgType.ERROR:
-                    print('ws connection closed with exception %s', ws.exception())
+                current_room = GameRoom(room_id)
+                active_rooms[room_id] = current_room
+                print(f"Sala creada: {room_id}")
+            
+            # --- UNIRSE A SALA ---
+            elif login_data['action'] == 'JOIN':
+                room_id = login_data.get('code')
+                if room_id in active_rooms:
+                    current_room = active_rooms[room_id]
+                else:
+                    await ws.send_json({"type": "error", "message": "❌ Código de sala inválido"})
+                    await ws.close()
+                    return ws
 
-        finally:
-            await self.handle_disconnect(ws)
-        
-        return ws
+            # --- LÓGICA DE JUEGO (Ya dentro de una sala) ---
+            if current_room:
+                if current_room.game_started:
+                     await ws.send_json({"type": "error", "message": "⚠️ PARTIDA EN CURSO ⚠️"})
+                     await ws.close()
+                     return ws
+
+                # Asignar ID y enviar estado inicial
+                pid = str(uuid.uuid4())[:8]
+                current_room.clients[ws] = pid
+                
+                # Setup Jugador
+                pos = current_room.get_start_pos(len(current_room.players))
+                colors = ["#ef4444", "#3b82f6", "#22c55e", "#eab308", "#a855f7", "#ec4899"]
+                
+                current_room.players[pid] = {
+                    "id": pid, "nickname": login_data.get('nickname', 'Player')[:12],
+                    "x": pos[0], "y": pos[1], "color": colors[len(current_room.players) % len(colors)],
+                    "alive": True, "range": 1, "max_bombs": 1, "ghost": False, "kick": False
+                }
+
+                # Enviar confirmación de sala y datos
+                await ws.send_json({
+                    "type": "init", 
+                    "room_code": current_room.room_id, # Enviamos el código para que lo vean
+                    "id": pid, 
+                    "players": current_room.players, 
+                    "map": current_room.map, 
+                    "game_started": current_room.game_started, 
+                    "host_id": list(current_room.players.keys())[0], 
+                    "grid_size": current_room.grid_size
+                })
+                await current_room.broadcast({'type': 'player_joined', 'player': current_room.players[pid]}, exclude=ws)
+
+                # BUCLE PRINCIPAL DEL JUGADOR
+                async for msg in ws:
+                    if msg.type == WSMsgType.TEXT:
+                        data = json.loads(msg.data)
+                        p = current_room.players.get(pid)
+                        if not p: continue
+
+                        if data["type"] == "start_trigger":
+                            # Lógica de inicio (delegada a la sala)
+                            cnt = len(current_room.players)
+                            sz = 13 if cnt <= 2 else (19 if cnt >= 5 else 15)
+                            current_room.regenerate_map(sz)
+                            current_room.game_started = True
+                            current_room.bombs = []
+                            idx = 0
+                            for pl in current_room.players.values():
+                                pl['x'], pl['y'] = current_room.get_start_pos(idx)
+                                idx += 1
+                            await current_room.broadcast({"type": "reset_game", "map": current_room.map, "players": current_room.players, "grid_size": sz, "host_id": pid})
+                            await current_room.broadcast({"type": "start_game_signal"})
+
+                        elif data["type"] == "move" and p['alive']:
+                            # Movimiento, items y kick
+                            gx, gy = int((data['x'] + 32) // 64), int((data['y'] + 32) // 64)
+                            if 0 <= gy < current_room.grid_size and 0 <= gx < current_room.grid_size:
+                                cell = current_room.map[gy][gx]
+                                if cell >= 3:
+                                    kind = 'UNKNOWN'
+                                    if cell == ITEM_FIRE: p['range'] += 1; kind = 'FIRE'
+                                    elif cell == ITEM_SPEED: kind = 'SPEED'
+                                    elif cell == ITEM_GHOST: p['ghost'] = True; kind = 'GHOST'
+                                    elif cell == ITEM_KICK: p['kick'] = True; kind = 'KICK'
+                                    elif cell == ITEM_AMMO: p['max_bombs'] += 1; kind = 'AMMO'
+                                    current_room.map[gy][gx] = FLOOR
+                                    await current_room.broadcast({'type': 'map_update', 'x': gx, 'y': gy, 'val': FLOOR})
+                                    await current_room.broadcast({'type': 'powerup', 'id': pid, 'kind': kind})
+
+                            if p['kick']:
+                                for b in current_room.bombs:
+                                    dist = ((p['x'] - b['x'])**2 + (p['y'] - b['y'])**2)**0.5
+                                    if dist < 40: 
+                                        dx = b['x'] - p['x']; dy = b['y'] - p['y']
+                                        if abs(dx) > abs(dy): b['vx'] = 1 if dx > 0 else -1; b['vy'] = 0
+                                        else: b['vx'] = 0; b['vy'] = 1 if dy > 0 else -1
+
+                            p["x"], p["y"] = data["x"], data["y"]
+                            await current_room.broadcast({"type": "update", "id": pid, "x": p["x"], "y": p["y"]}, exclude=ws)
+
+                        elif data["type"] == "bomb" and p['alive']:
+                            active = sum(1 for b in current_room.bombs if b['owner'] == pid)
+                            if active < p['max_bombs']:
+                                bx, by = data['x'], data['y']
+                                occ = any(b['x'] == bx and b['y'] == by for b in current_room.bombs)
+                                if not occ:
+                                    nb = {'x': bx, 'y': by, 'range': p['range'], 'owner': pid, 'vx': 0, 'vy': 0}
+                                    current_room.bombs.append(nb)
+                                    asyncio.create_task(current_room.bomb_logic(nb))
+                                    await current_room.broadcast({"type": "bombs_update", "bombs": current_room.bombs})
+
+    finally:
+        # Desconexión y limpieza
+        if current_room:
+            await current_room.handle_disconnect(ws)
+            # Si la sala se queda vacía, la borramos para ahorrar memoria
+            if not current_room.clients:
+                print(f"Sala vacía {current_room.room_id}, eliminando...")
+                current_room.stop()
+                if current_room.room_id in active_rooms:
+                    del active_rooms[current_room.room_id]
+
+    return ws
 
 async def main():
     PORT = int(os.environ.get("PORT", 10000))
-    print(f"🔥 Servidor V16 (SpawnFix) - Puerto {PORT}")
+    print(f"🔥 Servidor V17 (Room System) - Puerto {PORT}")
     
-    server = BombermanServer()
     app = web.Application()
-    app.add_routes([web.get('/', server.handle_request), web.get('/health', server.handle_request)])
+    app.add_routes([web.get('/', handle_request), web.get('/health', handle_request)])
     
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, '0.0.0.0', PORT)
     await site.start()
     
-    print("🚀 Servidor en línea")
+    print("🚀 Sistema de Salas Activo")
     await asyncio.Future()
 
 if __name__ == "__main__":
