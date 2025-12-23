@@ -3,9 +3,8 @@ import json
 import uuid
 import random
 import os
-# Importaciones específicas para la nueva versión de websockets (Python 3.13+)
-from websockets.asyncio.server import serve
-from websockets.http import Headers, Response
+import websockets # Usamos la importación estándar (Legacy)
+import http # Para códigos de estado HTTP
 
 # Constantes base
 WALL_HARD = 1
@@ -171,7 +170,8 @@ class BombermanServer:
                 idx += 1
             await self.broadcast({"type": "reset_game", "map": self.map, "players": self.players, "grid_size": self.grid_size, "host_id": list(self.players.keys())[0]})
 
-    async def handler(self, websocket):
+    # Actualizado para aceptar el argumento 'path' (estándar en legacy websockets)
+    async def handler(self, websocket, path):
         if self.game_started:
             await websocket.send(json.dumps({
                 "type": "error", "message": "⚠️ PARTIDA EN CURSO ⚠️\nEspera a que termine la ronda."
@@ -259,23 +259,18 @@ class BombermanServer:
         except: pass
         finally: await self.handle_disconnect(websocket)
 
-# Nueva función para manejar peticiones HTTP/Health Checks
-async def process_request(connection, request):
-    if request.path == "/health" or request.path == "/":
-        return Response(
-            200,
-            "OK",
-            Headers({"Content-Type": "text/plain"}),
-            b"OK"
-        )
+# Health check compatible con websockets legacy (usa tuplas, no objetos)
+async def process_request(path, request_headers):
+    if path == "/health" or path == "/":
+        return (http.HTTPStatus.OK, [], b"OK")
     return None
 
 async def main():
     PORT = int(os.environ.get("PORT", 10000))
-    print(f"🔥 Servidor V12 (Render Fix) - Puerto {PORT}")
+    print(f"🔥 Servidor V13 (Legacy Stable) - Puerto {PORT}")
     server = BombermanServer()
-    # Usamos la nueva sintaxis 'serve' de websockets.asyncio
-    async with serve(server.handler, "0.0.0.0", PORT, process_request=process_request):
+    # Usamos websockets.serve estándar que acepta tuplas en process_request
+    async with websockets.serve(server.handler, "0.0.0.0", PORT, process_request=process_request):
         print("Esperando conexiones...")
         await asyncio.Future()
 
