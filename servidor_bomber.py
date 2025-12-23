@@ -3,7 +3,8 @@ import json
 import websockets
 import uuid
 import random
-import os  # ✅ Import necesario para leer variables de entorno
+import os
+import http # Necesario para responder a Health Checks HTTP
 
 # Constantes base
 WALL_HARD = 1
@@ -106,14 +107,12 @@ class BombermanServer:
 
     async def bomb_logic(self, bomb_obj):
         await asyncio.sleep(3.0)
-        
         if bomb_obj not in self.bombs: return
         self.bombs.remove(bomb_obj)
         await self.broadcast({'type': 'bombs_update', 'bombs': self.bombs})
         
         bx, by = bomb_obj['x'], bomb_obj['y']
         brange = bomb_obj['range']
-        
         gx, gy = int((bx+32) // 64), int((by+32) // 64)
         explosion_cells = []
         directions = [(0,0), (0,-1), (0,1), (-1,0), (1,0)]
@@ -122,11 +121,9 @@ class BombermanServer:
             for i in range(brange if (dx, dy) != (0,0) else 1):
                 dist = i + 1 if (dx, dy) != (0,0) else 0
                 tx, ty = gx + (dx * dist), gy + (dy * dist)
-                
                 if 0 <= tx < self.grid_size and 0 <= ty < self.grid_size:
                     cell = self.map[ty][tx]
                     if cell == WALL_HARD: break
-                    
                     explosion_cells.append({'x': tx * 64, 'y': ty * 64})
                     
                     for pid, p in self.players.items():
@@ -151,11 +148,9 @@ class BombermanServer:
                         elif roll < 0.45: drop = ITEM_AMMO
                         elif roll < 0.50: drop = ITEM_KICK
                         elif roll < 0.55: drop = ITEM_GHOST
-                        
                         self.map[ty][tx] = drop
                         await self.broadcast({'type': 'map_update', 'x': tx, 'y': ty, 'val': drop})
                         break
-        
         await self.broadcast({'type': 'explosion', 'cells': explosion_cells})
 
     async def check_win_condition(self):
@@ -175,11 +170,18 @@ class BombermanServer:
                 idx += 1
             await self.broadcast({"type": "reset_game", "map": self.map, "players": self.players, "grid_size": self.grid_size, "host_id": list(self.players.keys())[0]})
 
+    # --- NUEVO: Manejador de peticiones HTTP para Health Checks ---
+    async def process_request(self, connection, request):
+        # Si recibimos una petición a /health o /, respondemos "OK" en vez de fallar
+        if request.path == "/health" or request.path == "/":
+            return http.HTTPStatus.OK, [], b"OK"
+        # Si no es health check, devolvemos None para que websockets continúe con la conexión normal
+        return None
+
     async def handler(self, websocket):
         if self.game_started:
             await websocket.send(json.dumps({
-                "type": "error", 
-                "message": "⚠️ PARTIDA EN CURSO ⚠️\nEspera a que termine la ronda."
+                "type": "error", "message": "⚠️ PARTIDA EN CURSO ⚠️\nEspera a que termine la ronda."
             }))
             return 
 
@@ -191,8 +193,7 @@ class BombermanServer:
         self.players[pid] = {
             "id": pid, "nickname": f"Player {pid[:4]}",
             "x": pos[0], "y": pos[1], "color": colors[len(self.players) % len(colors)],
-            "alive": True, 
-            "range": 1, "max_bombs": 1, "ghost": False, "kick": False
+            "alive": True, "range": 1, "max_bombs": 1, "ghost": False, "kick": False
         }
         
         await websocket.send(json.dumps({
@@ -266,13 +267,11 @@ class BombermanServer:
         finally: await self.handle_disconnect(websocket)
 
 async def main():
-    # ✅ CONFIGURACIÓN PARA RENDER
-    # Obtiene el puerto del sistema o usa 10000 por defecto
     PORT = int(os.environ.get("PORT", 10000))
-    print(f"🔥 Servidor Bomberman V10 - Puerto {PORT}")
-    print("   (Render Ready)")
+    print(f"🔥 Servidor V11 (Cloud Robust) - Puerto {PORT}")
     server = BombermanServer()
-    async with websockets.serve(server.handler, "0.0.0.0", PORT):
+    # Agregamos process_request para manejar Health Checks
+    async with websockets.serve(server.handler, "0.0.0.0", PORT, process_request=server.process_request):
         print("Esperando conexiones...")
         await asyncio.Future()
 
