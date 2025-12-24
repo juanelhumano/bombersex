@@ -21,7 +21,8 @@ class GameRoom:
         self.clients = {} 
         self.players = {} 
         self.game_started = False
-        self.time_left = 360 # CAMBIO: 6 minutos
+        self.game_over_processing = False # NUEVO: Candado para evitar múltiples Game Overs
+        self.time_left = 360
         self.grid_size = 15
         self.map = []
         self.bombs = [] 
@@ -82,7 +83,9 @@ class GameRoom:
             if pid in self.players: del self.players[pid]
             new_host = list(self.players.keys())[0] if self.players else None
             await self.broadcast({'type': 'player_left', 'id': pid, 'new_host': new_host})
-            await self.check_win_condition()
+            # Solo checamos victoria si el juego está activo y NO estamos ya procesando un final
+            if self.game_started and not self.game_over_processing:
+                await self.check_win_condition()
 
     async def disable_ghost_later(self, pid, duration):
         await asyncio.sleep(duration)
@@ -90,21 +93,21 @@ class GameRoom:
             self.players[pid]['ghost'] = False
             await self.broadcast({'type': 'powerup_expired', 'id': pid, 'kind': 'GHOST'})
 
-    # --- TIMER LOOP ACTUALIZADO ---
     async def game_timer_loop(self):
         try:
-            self.time_left = 360 # 6 minutos
+            self.time_left = 360 
             while self.time_left > 0:
+                if not self.game_started: break # Seguridad extra
                 await asyncio.sleep(1)
                 self.time_left -= 1
                 await self.broadcast({'type': 'timer_update', 'time': self.time_left})
 
-                # MODO CAOS: Últimos 90 segundos
                 if self.time_left < 90:
-                    if self.time_left % 3 == 0: # Spawn cada 3 segs
+                    if self.time_left % 3 == 0: 
                         await self.spawn_chaos_item()
 
-            await self.handle_time_up()
+            if self.game_started and not self.game_over_processing:
+                await self.handle_time_up()
         except asyncio.CancelledError:
             pass
 
@@ -125,6 +128,9 @@ class GameRoom:
             await self.broadcast({'type': 'map_update', 'x': gx, 'y': gy, 'val': item, 'chaos': True})
 
     async def handle_time_up(self):
+        if self.game_over_processing: return
+        self.game_over_processing = True # LOCK
+
         alive_count = sum(1 for p in self.players.values() if p['alive'])
         if alive_count > 1:
             await self.broadcast({'type': 'game_over', 'winner_id': None, 'winner_name': 'EMPATE (Tiempo Agotado)'})
@@ -133,20 +139,30 @@ class GameRoom:
             await self.broadcast({'type': 'game_over', 'winner_id': winner['id'], 'winner_name': winner['nickname']})
         else:
             await self.broadcast({'type': 'game_over', 'winner_id': None, 'winner_name': 'Nadie (Empate)'})
-        await self.end_game_sequence()
+        
+        asyncio.create_task(self.end_game_sequence())
 
     async def end_game_sequence(self):
         if self.timer_task: self.timer_task.cancel()
-        await asyncio.sleep(5)
+        
+        # Esperar 8 segundos para que lean el ganador
+        await asyncio.sleep(8)
+        
         self.game_started = False
         self.regenerate_map(15) 
         self.bombs = []
         idx = 0
         for pid, p in self.players.items():
             pos = self.get_start_pos(idx)
+            # Reset completo de stats
             p.update({"alive": True, "x": pos[0], "y": pos[1], "range": 1, "max_bombs": 1, "ghost": False, "kick": False})
             idx += 1
+        
+        # Enviamos reset_game, esto devolverá a los clientes al Lobby
         await self.broadcast({"type": "reset_game", "map": self.map, "players": self.players, "grid_size": self.grid_size, "host_id": list(self.players.keys())[0]})
+        
+        # Liberamos el candado para la siguiente partida
+        self.game_over_processing = False
 
     async def physics_loop(self):
         try:
@@ -221,17 +237,47 @@ class GameRoom:
             if hit:
                 p['alive'] = False
                 await self.broadcast({'type': 'player_killed', 'id': pid})
-                asyncio.create_task(self.check_win_condition())
+                # IMPORTANTE: No llamamos directamente a check_win, dejamos que fluya
+                # pero si queremos velocidad, usamos create_task
+                if not self.game_over_processing:
+                    asyncio.create_task(self.check_win_condition())
         await self.broadcast({'type': 'explosion', 'cells': explosion_cells})
 
     async def check_win_condition(self):
-        if not self.game_started or len(self.players) < 2: return
+        # SI YA ESTAMOS PROCESANDO UN GAME OVER, IGNORAMOS ESTA LLAMADA
+        if self.game_over_processing or not self.game_started: 
+            return
+
         alive = [p for p in self.players.values() if p['alive']]
-        if len(alive) <= 1:
-            winner = alive[0] if alive else None
+        winner = None
+        game_over = False
+        winner_name = ""
+
+        # Condición de victoria: Queda 1 o 0
+        if len(alive) == 1:
+            # Tenemos un ganador claro
+            winner = alive[0]
+            winner_name = winner['nickname']
+            game_over = True
+        elif len(alive) == 0 and len(self.players) > 1:
+            # Empate total (todos muertos)
+            winner_name = "Nadie (Empate)"
+            game_over = True
+        elif len(self.players) == 1 and len(alive) == 0:
+            # Jugando solo y murió
+            winner_name = "Nadie"
+            game_over = True
+
+        if game_over:
+            self.game_over_processing = True # ACTIVAR CANDADO
             if self.timer_task: self.timer_task.cancel()
-            await self.broadcast({'type': 'game_over', 'winner_id': winner['id'] if winner else None, 'winner_name': winner['nickname'] if winner else 'Nadie'})
-            await self.end_game_sequence()
+            
+            await self.broadcast({
+                'type': 'game_over', 
+                'winner_id': winner['id'] if winner else None, 
+                'winner_name': winner_name
+            })
+            asyncio.create_task(self.end_game_sequence())
 
 # --- GESTOR DE SALAS ---
 active_rooms = {} 
@@ -307,22 +353,16 @@ async def handle_request(request):
                                     await current_room.broadcast({'type': 'map_update', 'x': gx, 'y': gy, 'val': FLOOR})
                                     await current_room.broadcast({'type': 'powerup', 'id': pid, 'kind': kind})
                             
-                            # --- FIX KICK LOGIC ---
                             if p['kick']:
                                 for b in current_room.bombs:
                                     dist = ((p['x'] - b['x'])**2 + (p['y'] - b['y'])**2)**0.5
-                                    # Deadzone (para no moverla al ponerla)
                                     if dist < 28: continue
-                                    # Activation Zone: AUMENTADO A 75 (Antes 60)
-                                    # Esto permite detectar la colisión desde fuera de la bomba
                                     if dist < 75: 
                                         idx, idy = data.get('dx', 0), data.get('dy', 0)
                                         if idx == 0 and idy == 0: continue
                                         tox, toy = b['x'] - p['x'], b['y'] - p['y']
-                                        # Producto punto para verificar que empujamos HACIA la bomba
                                         if (idx * tox) + (idy * toy) > 0:
                                             b['vx'] = idx; b['vy'] = idy
-                                            # Normalizar diagonal
                                             if b['vx'] != 0 and b['vy'] != 0:
                                                 if abs(tox) > abs(toy): b['vy'] = 0
                                                 else: b['vx'] = 0
@@ -349,7 +389,7 @@ async def handle_request(request):
 
 async def main():
     PORT = int(os.environ.get("PORT", 10000))
-    print(f"🔥 Servidor V28 (6mins, 90s Chaos, Kick Fix) - Puerto {PORT}")
+    print(f"🔥 Servidor V29 (Winner Fix & Lobby) - Puerto {PORT}")
     app = web.Application()
     app.add_routes([web.get('/', handle_request), web.get('/health', handle_request)])
     runner = web.AppRunner(app); await runner.setup()
