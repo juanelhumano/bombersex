@@ -21,7 +21,7 @@ class GameRoom:
         self.clients = {} 
         self.players = {} 
         self.game_started = False
-        self.time_left = 240 # 4 minutos por defecto
+        self.time_left = 360 # CAMBIO: 6 minutos
         self.grid_size = 15
         self.map = []
         self.bombs = [] 
@@ -90,63 +90,49 @@ class GameRoom:
             self.players[pid]['ghost'] = False
             await self.broadcast({'type': 'powerup_expired', 'id': pid, 'kind': 'GHOST'})
 
-    # --- NUEVO: Loop del Timer y Eventos de Caos ---
+    # --- TIMER LOOP ACTUALIZADO ---
     async def game_timer_loop(self):
         try:
-            self.time_left = 240 # Reiniciar a 4 minutos
+            self.time_left = 360 # 6 minutos
             while self.time_left > 0:
                 await asyncio.sleep(1)
                 self.time_left -= 1
-                
-                # Enviar actualización de tiempo
                 await self.broadcast({'type': 'timer_update', 'time': self.time_left})
 
-                # MODO CAOS: Últimos 60 segundos
-                if self.time_left < 60:
-                    # Cada 3 segundos spawneamos algo random
-                    if self.time_left % 3 == 0:
+                # MODO CAOS: Últimos 90 segundos
+                if self.time_left < 90:
+                    if self.time_left % 3 == 0: # Spawn cada 3 segs
                         await self.spawn_chaos_item()
 
-            # Tiempo agotado -> Verificar Empate o Ganador
             await self.handle_time_up()
-
         except asyncio.CancelledError:
             pass
 
     async def spawn_chaos_item(self):
-        # Buscar casillas vacías (FLOOR) que no tengan bombas ni jugadores
         empty_spots = []
         for y in range(self.grid_size):
             for x in range(self.grid_size):
                 if self.map[y][x] == FLOOR:
-                    # Verificar que no hay bomba
                     has_bomb = any(int((b['x']+32)//64) == x and int((b['y']+32)//64) == y for b in self.bombs)
                     if not has_bomb:
                         empty_spots.append((x, y))
         
         if empty_spots:
             gx, gy = random.choice(empty_spots)
-            # Items aleatorios poderosos para incitar el caos
             items = [ITEM_FIRE, ITEM_AMMO, ITEM_KICK, ITEM_SPEED, ITEM_GHOST]
             item = random.choice(items)
-            
             self.map[gy][gx] = item
-            # Animación especial o sonido podría manejarse en cliente con este evento
             await self.broadcast({'type': 'map_update', 'x': gx, 'y': gy, 'val': item, 'chaos': True})
 
     async def handle_time_up(self):
         alive_count = sum(1 for p in self.players.values() if p['alive'])
         if alive_count > 1:
-            # Empate
             await self.broadcast({'type': 'game_over', 'winner_id': None, 'winner_name': 'EMPATE (Tiempo Agotado)'})
         elif alive_count == 1:
-            # Ganador por defecto
             winner = next((p for p in self.players.values() if p['alive']), None)
             await self.broadcast({'type': 'game_over', 'winner_id': winner['id'], 'winner_name': winner['nickname']})
         else:
-            # Todos muertos
             await self.broadcast({'type': 'game_over', 'winner_id': None, 'winner_name': 'Nadie (Empate)'})
-        
         await self.end_game_sequence()
 
     async def end_game_sequence(self):
@@ -243,9 +229,7 @@ class GameRoom:
         alive = [p for p in self.players.values() if p['alive']]
         if len(alive) <= 1:
             winner = alive[0] if alive else None
-            # Cancelar timer si gana alguien antes del tiempo
             if self.timer_task: self.timer_task.cancel()
-            
             await self.broadcast({'type': 'game_over', 'winner_id': winner['id'] if winner else None, 'winner_name': winner['nickname'] if winner else 'Nadie'})
             await self.end_game_sequence()
 
@@ -323,16 +307,22 @@ async def handle_request(request):
                                     await current_room.broadcast({'type': 'map_update', 'x': gx, 'y': gy, 'val': FLOOR})
                                     await current_room.broadcast({'type': 'powerup', 'id': pid, 'kind': kind})
                             
+                            # --- FIX KICK LOGIC ---
                             if p['kick']:
                                 for b in current_room.bombs:
                                     dist = ((p['x'] - b['x'])**2 + (p['y'] - b['y'])**2)**0.5
+                                    # Deadzone (para no moverla al ponerla)
                                     if dist < 28: continue
-                                    if dist < 60: 
+                                    # Activation Zone: AUMENTADO A 75 (Antes 60)
+                                    # Esto permite detectar la colisión desde fuera de la bomba
+                                    if dist < 75: 
                                         idx, idy = data.get('dx', 0), data.get('dy', 0)
                                         if idx == 0 and idy == 0: continue
                                         tox, toy = b['x'] - p['x'], b['y'] - p['y']
+                                        # Producto punto para verificar que empujamos HACIA la bomba
                                         if (idx * tox) + (idy * toy) > 0:
                                             b['vx'] = idx; b['vy'] = idy
+                                            # Normalizar diagonal
                                             if b['vx'] != 0 and b['vy'] != 0:
                                                 if abs(tox) > abs(toy): b['vy'] = 0
                                                 else: b['vx'] = 0
@@ -359,7 +349,7 @@ async def handle_request(request):
 
 async def main():
     PORT = int(os.environ.get("PORT", 10000))
-    print(f"🔥 Servidor V27 (Timer & Chaos) - Puerto {PORT}")
+    print(f"🔥 Servidor V28 (6mins, 90s Chaos, Kick Fix) - Puerto {PORT}")
     app = web.Application()
     app.add_routes([web.get('/', handle_request), web.get('/health', handle_request)])
     runner = web.AppRunner(app); await runner.setup()
