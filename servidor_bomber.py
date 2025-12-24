@@ -21,7 +21,7 @@ class GameRoom:
         self.clients = {} 
         self.players = {} 
         self.game_started = False
-        self.game_over_processing = False # NUEVO: Candado para evitar múltiples Game Overs
+        self.game_over_processing = False 
         self.time_left = 360
         self.grid_size = 15
         self.map = []
@@ -83,7 +83,6 @@ class GameRoom:
             if pid in self.players: del self.players[pid]
             new_host = list(self.players.keys())[0] if self.players else None
             await self.broadcast({'type': 'player_left', 'id': pid, 'new_host': new_host})
-            # Solo checamos victoria si el juego está activo y NO estamos ya procesando un final
             if self.game_started and not self.game_over_processing:
                 await self.check_win_condition()
 
@@ -97,7 +96,7 @@ class GameRoom:
         try:
             self.time_left = 360 
             while self.time_left > 0:
-                if not self.game_started: break # Seguridad extra
+                if not self.game_started: break 
                 await asyncio.sleep(1)
                 self.time_left -= 1
                 await self.broadcast({'type': 'timer_update', 'time': self.time_left})
@@ -129,7 +128,7 @@ class GameRoom:
 
     async def handle_time_up(self):
         if self.game_over_processing: return
-        self.game_over_processing = True # LOCK
+        self.game_over_processing = True 
 
         alive_count = sum(1 for p in self.players.values() if p['alive'])
         if alive_count > 1:
@@ -140,13 +139,12 @@ class GameRoom:
         else:
             await self.broadcast({'type': 'game_over', 'winner_id': None, 'winner_name': 'Nadie (Empate)'})
         
-        asyncio.create_task(self.end_game_sequence())
+        # Eliminamos la llamada automática a end_game_sequence
+        # Ahora esperamos a que el Host mande "request_restart"
 
-    async def end_game_sequence(self):
+    # --- NUEVA FUNCIÓN PARA REINICIO MANUAL ---
+    async def manual_reset(self):
         if self.timer_task: self.timer_task.cancel()
-        
-        # Esperar 8 segundos para que lean el ganador
-        await asyncio.sleep(8)
         
         self.game_started = False
         self.regenerate_map(15) 
@@ -154,14 +152,10 @@ class GameRoom:
         idx = 0
         for pid, p in self.players.items():
             pos = self.get_start_pos(idx)
-            # Reset completo de stats
             p.update({"alive": True, "x": pos[0], "y": pos[1], "range": 1, "max_bombs": 1, "ghost": False, "kick": False})
             idx += 1
         
-        # Enviamos reset_game, esto devolverá a los clientes al Lobby
         await self.broadcast({"type": "reset_game", "map": self.map, "players": self.players, "grid_size": self.grid_size, "host_id": list(self.players.keys())[0]})
-        
-        # Liberamos el candado para la siguiente partida
         self.game_over_processing = False
 
     async def physics_loop(self):
@@ -237,47 +231,28 @@ class GameRoom:
             if hit:
                 p['alive'] = False
                 await self.broadcast({'type': 'player_killed', 'id': pid})
-                # IMPORTANTE: No llamamos directamente a check_win, dejamos que fluya
-                # pero si queremos velocidad, usamos create_task
                 if not self.game_over_processing:
                     asyncio.create_task(self.check_win_condition())
         await self.broadcast({'type': 'explosion', 'cells': explosion_cells})
 
     async def check_win_condition(self):
-        # SI YA ESTAMOS PROCESANDO UN GAME OVER, IGNORAMOS ESTA LLAMADA
-        if self.game_over_processing or not self.game_started: 
-            return
-
+        if self.game_over_processing or not self.game_started: return
         alive = [p for p in self.players.values() if p['alive']]
         winner = None
         game_over = False
         winner_name = ""
-
-        # Condición de victoria: Queda 1 o 0
         if len(alive) == 1:
-            # Tenemos un ganador claro
-            winner = alive[0]
-            winner_name = winner['nickname']
-            game_over = True
+            winner = alive[0]; winner_name = winner['nickname']; game_over = True
         elif len(alive) == 0 and len(self.players) > 1:
-            # Empate total (todos muertos)
-            winner_name = "Nadie (Empate)"
-            game_over = True
+            winner_name = "Nadie (Empate)"; game_over = True
         elif len(self.players) == 1 and len(alive) == 0:
-            # Jugando solo y murió
-            winner_name = "Nadie"
-            game_over = True
+            winner_name = "Nadie"; game_over = True
 
         if game_over:
-            self.game_over_processing = True # ACTIVAR CANDADO
+            self.game_over_processing = True 
             if self.timer_task: self.timer_task.cancel()
-            
-            await self.broadcast({
-                'type': 'game_over', 
-                'winner_id': winner['id'] if winner else None, 
-                'winner_name': winner_name
-            })
-            asyncio.create_task(self.end_game_sequence())
+            await self.broadcast({'type': 'game_over', 'winner_id': winner['id'] if winner else None, 'winner_name': winner_name})
+            # NO llamamos a end_game_sequence, esperamos botón
 
 # --- GESTOR DE SALAS ---
 active_rooms = {} 
@@ -333,10 +308,15 @@ async def handle_request(request):
                             idx = 0
                             for pl in current_room.players.values(): pl['x'], pl['y'] = current_room.get_start_pos(idx); idx += 1
                             await current_room.broadcast({"type": "reset_game", "map": current_room.map, "players": current_room.players, "grid_size": sz, "host_id": pid})
-                            # INICIAR TIMER
                             if current_room.timer_task: current_room.timer_task.cancel()
                             current_room.timer_task = asyncio.create_task(current_room.game_timer_loop())
                             await current_room.broadcast({"type": "start_game_signal"})
+                        
+                        # --- NUEVO: PETICIÓN DE REINICIO ---
+                        elif data["type"] == "request_restart":
+                            # Solo el Host puede reiniciar
+                            if pid == list(current_room.players.keys())[0]:
+                                await current_room.manual_reset()
 
                         elif data["type"] == "move" and p['alive']:
                             gx, gy = int((data['x'] + 32) // 64), int((data['y'] + 32) // 64)
@@ -352,7 +332,6 @@ async def handle_request(request):
                                     current_room.map[gy][gx] = FLOOR
                                     await current_room.broadcast({'type': 'map_update', 'x': gx, 'y': gy, 'val': FLOOR})
                                     await current_room.broadcast({'type': 'powerup', 'id': pid, 'kind': kind})
-                            
                             if p['kick']:
                                 for b in current_room.bombs:
                                     dist = ((p['x'] - b['x'])**2 + (p['y'] - b['y'])**2)**0.5
@@ -366,10 +345,8 @@ async def handle_request(request):
                                             if b['vx'] != 0 and b['vy'] != 0:
                                                 if abs(tox) > abs(toy): b['vy'] = 0
                                                 else: b['vx'] = 0
-
                             p["x"], p["y"] = data["x"], data["y"]
                             await current_room.broadcast({"type": "update", "id": pid, "x": p["x"], "y": p["y"]}, exclude=ws)
-
                         elif data["type"] == "bomb" and p['alive']:
                             active = sum(1 for b in current_room.bombs if b['owner'] == pid)
                             if active < p['max_bombs']:
@@ -389,7 +366,7 @@ async def handle_request(request):
 
 async def main():
     PORT = int(os.environ.get("PORT", 10000))
-    print(f"🔥 Servidor V29 (Winner Fix & Lobby) - Puerto {PORT}")
+    print(f"🔥 Servidor V30 (Manual Restart) - Puerto {PORT}")
     app = web.Application()
     app.add_routes([web.get('/', handle_request), web.get('/health', handle_request)])
     runner = web.AppRunner(app); await runner.setup()
