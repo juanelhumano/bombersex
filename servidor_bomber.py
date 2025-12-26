@@ -22,7 +22,7 @@ class GameRoom:
         self.players = {} 
         self.game_started = False
         self.game_over_processing = False 
-        self.time_left = 360
+        self.time_left = 240 # CAMBIO: 4 minutos
         self.grid_size = 15
         self.map = []
         self.bombs = [] 
@@ -94,14 +94,15 @@ class GameRoom:
 
     async def game_timer_loop(self):
         try:
-            self.time_left = 360 
+            self.time_left = 240 # Reinicio a 4 min
             while self.time_left > 0:
                 if not self.game_started: break 
                 await asyncio.sleep(1)
                 self.time_left -= 1
                 await self.broadcast({'type': 'timer_update', 'time': self.time_left})
 
-                if self.time_left < 90:
+                # MODO CAOS: Últimos 60 segundos
+                if self.time_left < 60:
                     if self.time_left % 3 == 0: 
                         await self.spawn_chaos_item()
 
@@ -138,11 +139,7 @@ class GameRoom:
             await self.broadcast({'type': 'game_over', 'winner_id': winner['id'], 'winner_name': winner['nickname']})
         else:
             await self.broadcast({'type': 'game_over', 'winner_id': None, 'winner_name': 'Nadie (Empate)'})
-        
-        # Eliminamos la llamada automática a end_game_sequence
-        # Ahora esperamos a que el Host mande "request_restart"
 
-    # --- NUEVA FUNCIÓN PARA REINICIO MANUAL ---
     async def manual_reset(self):
         if self.timer_task: self.timer_task.cancel()
         
@@ -252,7 +249,6 @@ class GameRoom:
             self.game_over_processing = True 
             if self.timer_task: self.timer_task.cancel()
             await self.broadcast({'type': 'game_over', 'winner_id': winner['id'] if winner else None, 'winner_name': winner_name})
-            # NO llamamos a end_game_sequence, esperamos botón
 
 # --- GESTOR DE SALAS ---
 active_rooms = {} 
@@ -312,9 +308,7 @@ async def handle_request(request):
                             current_room.timer_task = asyncio.create_task(current_room.game_timer_loop())
                             await current_room.broadcast({"type": "start_game_signal"})
                         
-                        # --- NUEVO: PETICIÓN DE REINICIO ---
                         elif data["type"] == "request_restart":
-                            # Solo el Host puede reiniciar
                             if pid == list(current_room.players.keys())[0]:
                                 await current_room.manual_reset()
 
@@ -366,7 +360,7 @@ async def handle_request(request):
 
 async def main():
     PORT = int(os.environ.get("PORT", 10000))
-    print(f"🔥 Servidor V30 (Manual Restart) - Puerto {PORT}")
+    print(f"🔥 Servidor V31 (4min + Audio Support) - Puerto {PORT}")
     app = web.Application()
     app.add_routes([web.get('/', handle_request), web.get('/health', handle_request)])
     runner = web.AppRunner(app); await runner.setup()
