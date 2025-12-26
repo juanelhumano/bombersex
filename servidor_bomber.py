@@ -22,10 +22,12 @@ class GameRoom:
         self.players = {} 
         self.game_started = False
         self.game_over_processing = False 
-        self.time_left = 240 # CAMBIO: 4 minutos
+        self.time_left = 240
         self.grid_size = 15
         self.map = []
         self.bombs = [] 
+        # NUEVO: Configuración de Lobby
+        self.arena_id = 0 # 0: Classic, 1: Inferno, 2: Jungle, 3: Cyber
         self.regenerate_map(15)
         self.physics_task = asyncio.create_task(self.physics_loop())
         self.timer_task = None
@@ -36,6 +38,7 @@ class GameRoom:
 
     def get_spawn_grid_coords(self, size):
         mid = size // 2
+        # 8 Puntos de aparición para 8 jugadores
         spawns = [
             (1, 1), (size-2, size-2), (size-2, 1), (1, size-2),
             (mid, 1), (mid, size-2), (1, mid), (size-2, mid)
@@ -65,6 +68,12 @@ class GameRoom:
         idx = index % len(spawns)
         gx, gy = spawns[idx]
         return (gx * 64, gy * 64)
+        
+    def get_available_skin(self):
+        taken = set(p['skin_id'] for p in self.players.values())
+        for i in range(8):
+            if i not in taken: return i
+        return 0 # Fallback
 
     async def broadcast(self, message, exclude=None):
         if not self.clients: return
@@ -94,14 +103,13 @@ class GameRoom:
 
     async def game_timer_loop(self):
         try:
-            self.time_left = 240 # Reinicio a 4 min
+            self.time_left = 240 
             while self.time_left > 0:
                 if not self.game_started: break 
                 await asyncio.sleep(1)
                 self.time_left -= 1
                 await self.broadcast({'type': 'timer_update', 'time': self.time_left})
 
-                # MODO CAOS: Últimos 60 segundos
                 if self.time_left < 60:
                     if self.time_left % 3 == 0: 
                         await self.spawn_chaos_item()
@@ -152,7 +160,7 @@ class GameRoom:
             p.update({"alive": True, "x": pos[0], "y": pos[1], "range": 1, "max_bombs": 1, "ghost": False, "kick": False})
             idx += 1
         
-        await self.broadcast({"type": "reset_game", "map": self.map, "players": self.players, "grid_size": self.grid_size, "host_id": list(self.players.keys())[0]})
+        await self.broadcast({"type": "reset_game", "map": self.map, "players": self.players, "grid_size": self.grid_size, "host_id": list(self.players.keys())[0], "arena_id": self.arena_id})
         self.game_over_processing = False
 
     async def physics_loop(self):
@@ -273,20 +281,31 @@ async def handle_request(request):
                 else: await ws.send_json({"type": "error", "message": "❌ Código inválido"}); await ws.close(); return ws
             
             if current_room:
+                if len(current_room.players) >= 8:
+                    await ws.send_json({"type": "error", "message": "❌ Sala llena (Max 8)"})
+                    await ws.close()
+                    return ws
+
                 if current_room.game_started: await ws.send_json({"type": "error", "message": "⚠️ PARTIDA EN CURSO ⚠️"}); await ws.close(); return ws
+                
                 pid = str(uuid.uuid4())[:8]
                 current_room.clients[ws] = pid
                 pos = current_room.get_start_pos(len(current_room.players))
-                colors = ["#ef4444", "#3b82f6", "#22c55e", "#eab308", "#a855f7", "#ec4899", "#06b6d4", "#f97316"]
+                skin_id = current_room.get_available_skin()
+                
                 current_room.players[pid] = {
                     "id": pid, "nickname": login_data.get('nickname', 'Player')[:12],
-                    "x": pos[0], "y": pos[1], "color": colors[len(current_room.players) % len(colors)],
+                    "x": pos[0], "y": pos[1], 
+                    "skin_id": skin_id, # NUEVO: ID de color (0-7)
                     "alive": True, "range": 1, "max_bombs": 1, "ghost": False, "kick": False
                 }
+                
+                # Enviamos arena_id en el init
                 await ws.send_json({
                     "type": "init", "room_code": current_room.room_id, "id": pid, "players": current_room.players, 
                     "map": current_room.map, "game_started": current_room.game_started, 
-                    "host_id": list(current_room.players.keys())[0], "grid_size": current_room.grid_size
+                    "host_id": list(current_room.players.keys())[0], "grid_size": current_room.grid_size,
+                    "arena_id": current_room.arena_id
                 })
                 await current_room.broadcast({'type': 'player_joined', 'player': current_room.players[pid]}, exclude=ws)
 
@@ -295,7 +314,27 @@ async def handle_request(request):
                         data = json.loads(msg.data)
                         p = current_room.players.get(pid)
                         if not p: continue
-                        if data["type"] == "start_trigger":
+                        
+                        # --- LÓGICA DE LOBBY ---
+                        if data["type"] == "select_skin":
+                            wanted_skin = data.get("skin_id")
+                            # Verificar si está ocupado
+                            taken = False
+                            for other in current_room.players.values():
+                                if other['id'] != pid and other['skin_id'] == wanted_skin:
+                                    taken = True
+                                    break
+                            if not taken and 0 <= wanted_skin <= 7:
+                                p['skin_id'] = wanted_skin
+                                await current_room.broadcast({'type': 'lobby_update', 'players': current_room.players, 'arena_id': current_room.arena_id})
+
+                        elif data["type"] == "select_arena":
+                            # Solo Host
+                            if pid == list(current_room.players.keys())[0]:
+                                current_room.arena_id = data.get("arena_id", 0)
+                                await current_room.broadcast({'type': 'lobby_update', 'players': current_room.players, 'arena_id': current_room.arena_id})
+
+                        elif data["type"] == "start_trigger":
                             cnt = len(current_room.players)
                             sz = 13 if cnt <= 2 else (19 if cnt >= 5 else 15)
                             current_room.regenerate_map(sz)
@@ -303,7 +342,8 @@ async def handle_request(request):
                             current_room.bombs = []
                             idx = 0
                             for pl in current_room.players.values(): pl['x'], pl['y'] = current_room.get_start_pos(idx); idx += 1
-                            await current_room.broadcast({"type": "reset_game", "map": current_room.map, "players": current_room.players, "grid_size": sz, "host_id": pid})
+                            # Broadcast incluye arena_id
+                            await current_room.broadcast({"type": "reset_game", "map": current_room.map, "players": current_room.players, "grid_size": sz, "host_id": pid, "arena_id": current_room.arena_id})
                             if current_room.timer_task: current_room.timer_task.cancel()
                             current_room.timer_task = asyncio.create_task(current_room.game_timer_loop())
                             await current_room.broadcast({"type": "start_game_signal"})
@@ -360,7 +400,7 @@ async def handle_request(request):
 
 async def main():
     PORT = int(os.environ.get("PORT", 10000))
-    print(f"🔥 Servidor V31 (4min + Audio Support) - Puerto {PORT}")
+    print(f"🔥 Servidor V32 (Advanced Lobby) - Puerto {PORT}")
     app = web.Application()
     app.add_routes([web.get('/', handle_request), web.get('/health', handle_request)])
     runner = web.AppRunner(app); await runner.setup()
